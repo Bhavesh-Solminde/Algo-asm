@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Candle Generator Live</title>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --panel: #11161f;
+      --raised: #171d29;
+      --line: #222a38;
+      --text: #d9dee7;
+      --muted: #8a93a4;
+      --faint: #5b6476;
+      --up: #26a69a;
+      --down: #ef5350;
+      --accent: #f0b429;
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+      font-variant-numeric: tabular-nums;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px 18px;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .brand { display: flex; align-items: baseline; gap: 10px; margin-right: auto; }
+    .brand h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .01em; }
+    .brand .sym { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+    .clock { font-family: var(--mono); color: var(--accent); font-size: 12px; }
+    .group { display: flex; align-items: center; gap: 6px; }
+    .group > label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+    .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+    .seg button { border: 0; border-right: 1px solid var(--line); border-radius: 0; }
+    .seg button:last-child { border-right: 0; }
+    button, select {
+      background: var(--raised);
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 5px 10px;
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled), select:hover { background: #1e2533; }
+    button:disabled { color: var(--faint); cursor: default; }
+    button[aria-pressed="true"],
+    button[aria-pressed="true"]:hover:not(:disabled) { background: var(--accent); color: #1a1405; font-weight: 600; }
+    button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+    main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 360px; min-height: 0; }
+    #chart-wrap { position: relative; min-height: 420px; border-right: 1px solid var(--line); }
+    #chart { position: absolute; inset: 0; }
+    #stats {
+      position: absolute; left: 12px; top: 10px; z-index: 2;
+      font-family: var(--mono); font-size: 11px; color: var(--muted);
+      background: rgba(11, 14, 20, .8); padding: 4px 8px; border-radius: 4px; pointer-events: none;
+    }
+    aside { overflow-y: auto; background: var(--panel); }
+    section { padding: 14px 16px; border-bottom: 1px solid var(--line); }
+    section h2 {
+      margin: 0 0 10px; font-size: 11px; font-weight: 600; color: var(--muted);
+      text-transform: uppercase; letter-spacing: .08em;
+    }
+    ol.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+    ol.steps li { display: grid; grid-template-columns: 20px 1fr; gap: 8px; }
+    .n {
+      width: 20px; height: 20px; border-radius: 50%; background: var(--raised); border: 1px solid var(--line);
+      display: grid; place-items: center; font-size: 11px; color: var(--muted);
+    }
+    .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+    .k { font-weight: 600; }
+    .v { font-family: var(--mono); }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .bar { position: relative; height: 6px; background: var(--raised); border-radius: 3px; margin-top: 6px; overflow: hidden; }
+    .bar .mid { position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--faint); }
+    .bar .fill { position: absolute; top: 0; bottom: 0; border-radius: 3px; }
+    svg { display: block; }
+    .up { color: var(--up); }
+    .down { color: var(--down); }
+    .flag { color: var(--accent); font-weight: 600; }
+
+    .anatomy { display: grid; grid-template-columns: 150px 1fr; gap: 12px; align-items: center; }
+    .ohlc { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-family: var(--mono); font-size: 12px; }
+    .ohlc dt { color: var(--muted); }
+    .ohlc dd { margin: 0; text-align: right; }
+    .split { display: flex; height: 8px; border-radius: 4px; overflow: hidden; margin-top: 10px; background: var(--raised); }
+    .split span { display: block; height: 100%; }
+    .legend { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+    .tune {
+      display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px 10px;
+      margin-top: 10px; padding: 8px 10px; background: var(--raised); border: 1px solid var(--line); border-radius: 6px;
+    }
+    .tune label { grid-column: 1 / -1; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+    .tune input[type="range"] { width: 100%; margin: 0; accent-color: var(--accent); }
+    .tune .num { display: inline-flex; align-items: center; gap: 4px; font-family: var(--mono); color: var(--muted); }
+    .tune input[type="number"] {
+      width: 64px; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px;
+      padding: 3px 6px; font: inherit; font-family: var(--mono); font-size: 12px; text-align: right;
+    }
+    .tune input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+    #log { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: 11px; display: grid; gap: 2px; }
+    #log li { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #log li.close { color: var(--text); background: var(--raised); border-left: 2px solid var(--accent); padding: 2px 6px; margin: 2px 0; }
+
+    /* UP/DOWN buttons + Positions panel */
+    .trade-group { gap: 4px; }
+    .trade-group .dir { font-weight: 700; padding: 6px 14px; min-width: 60px; }
+    .trade-group .dir.up    { background: #0f2e2a; color: var(--up);   border-color: #1a5048; }
+    .trade-group .dir.up:hover:not(:disabled)    { background: #1a4a44; }
+    .trade-group .dir.down  { background: #2e1515; color: var(--down); border-color: #552626; }
+    .trade-group .dir.down:hover:not(:disabled)  { background: #4a2222; }
+    .trade-group .dir:disabled { opacity: .5; }
+
+    ul.positions { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+    ul.positions li {
+      background: var(--raised); border: 1px solid var(--line); border-radius: 6px;
+      padding: 8px 10px; font-size: 12px; display: grid; gap: 4px;
+    }
+    ul.positions .pos-head { display: flex; justify-content: space-between; align-items: center; }
+    ul.positions .pos-dir { font-family: var(--mono); font-weight: 600; letter-spacing: .04em; }
+    ul.positions .pos-dir.up { color: var(--up); }
+    ul.positions .pos-dir.down { color: var(--down); }
+    ul.positions .pos-style { color: var(--muted); font-size: 11px; }
+    ul.positions .pos-prices { font-family: var(--mono); color: var(--muted); font-size: 11px; }
+    ul.positions .pos-progress {
+      position: relative; height: 4px; background: var(--line); border-radius: 2px; overflow: hidden;
+    }
+    ul.positions .pos-progress .fill {
+      position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); transition: width .25s linear;
+    }
+    ul.positions .pos-countdown { font-family: var(--mono); color: var(--accent); font-size: 11px; }
+    ul.positions.settled .outcome { font-family: var(--mono); font-weight: 700; letter-spacing: .04em; }
+    ul.positions.settled .outcome.win { color: var(--up); }
+    ul.positions.settled .outcome.loss { color: var(--down); }
+    .positions-empty { color: var(--muted); font-size: 12px; font-style: italic; }
+
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; grid-template-rows: 60vh auto; }
+      #chart-wrap { border-right: 0; border-bottom: 1px solid var(--line); }
+      aside { overflow: visible; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h1>Candle generator — live</h1>
+      <span class="sym">AUDNZD_OTC</span>
+      <span class="clock" id="clock" title="Simulated chart time (UTC)">--:--:--</span>
+    </div>
+
+    <div class="group">
+      <label>Timeframe</label>
+      <div class="seg" id="tf">
+        <button data-tf="1m" aria-pressed="true">1m</button>
+        <button data-tf="5m">5m</button>
+        <button data-tf="15m">15m</button>
+        <button data-tf="1h">1h</button>
+      </div>
+    </div>
+
+    <div class="group">
+      <label>Speed</label>
+      <div class="seg" id="speed">
+        <button data-speed="1" title="Real time: 1 tick per second">1×</button>
+        <button data-speed="10">10×</button>
+        <button data-speed="60" title="A 1m candle forms in 1 second">60×</button>
+        <button data-speed="300">300×</button>
+      </div>
+    </div>
+
+    <div class="group">
+      <button id="pause">Pause</button>
+      <button id="step" disabled title="Advance exactly one tick">Step 1 tick</button>
+    </div>
+
+    <div class="group">
+      <label>Skip ahead</label>
+      <div class="seg">
+        <button data-skip="15">+15m</button>
+        <button data-skip="60">+1h</button>
+        <button data-skip="360">+6h</button>
+      </div>
+    </div>
+
+    <div class="group">
+      <label for="wicks">Wicks</label>
+      <select id="wicks">
+        <option value="0">A — original</option>
+        <option value="40">B — light</option>
+        <option value="60">C — medium</option>
+        <option value="90">D — strong</option>
+        <option value="120">E — very strong</option>
+      </select>
+      <button id="restart" title="Rebuild from the seed">Restart</button>
+    </div>
+
+    <div class="group trade-group">
+      <label>Win rate</label>
+      <div class="seg" id="winrate" title="Probability each new trade is placed on the winning side">
+        <button data-winrate="0.25">25%</button>
+        <button data-winrate="0.5" aria-pressed="true">50%</button>
+        <button data-winrate="1">100%</button>
+      </div>
+    </div>
+
+    <div class="group trade-group">
+      <label for="trade-duration">Trade</label>
+      <select id="trade-duration" title="Trade duration">
+        <option value="30">30s</option>
+        <option value="60" selected>60s</option>
+        <option value="120">2m</option>
+      </select>
+      <button class="dir up" data-dir="UP" title="Open an UP trade — WIN if close > entry at expiry">UP ▲</button>
+      <button class="dir down" data-dir="DOWN" title="Open a DOWN trade — WIN if close < entry at expiry">DOWN ▼</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="chart-wrap">
+      <div id="stats"></div>
+      <div id="chart"></div>
+    </div>
+
+    <aside>
+      <section>
+        <h2>How the last tick was made</h2>
+        <ol class="steps">
+          <li>
+            <span class="n">1</span>
+            <div>
+              <div class="row"><span class="k">Random shock</span><span class="v" id="z">—</span></div>
+              <div class="bar"><span class="mid"></span><span class="fill" id="z-bar"></span></div>
+              <div class="hint">A seeded random number (normal, ±1 typical). Up or down, big or small.</div>
+            </div>
+          </li>
+          <li>
+            <span class="n">2</span>
+            <div>
+              <div class="row"><span class="k">Volatility (GARCH)</span><span class="v" id="vol">—</span></div>
+              <svg id="vol-spark" width="100%" height="36" viewBox="0 0 300 36" preserveAspectRatio="none" aria-label="Volatility over the last ticks"></svg>
+              <div class="hint">How big moves are right now, vs normal. Big shocks raise it, so busy and quiet stretches cluster.</div>
+            </div>
+          </li>
+          <li>
+            <span class="n">3</span>
+            <div>
+              <div class="row"><span class="k">Momentum</span><span class="v" id="mom">—</span></div>
+              <div class="bar"><span class="mid"></span><span class="fill" id="mom-bar"></span></div>
+              <div class="hint" id="mom-hint"></div>
+              <div class="tune">
+                <label for="persist-num">trendPersistenceSec</label>
+                <input type="range" id="persist-range" min="0" max="300" step="5" value="0" aria-label="trendPersistenceSec slider" />
+                <span class="num"><input type="number" id="persist-num" min="0" max="600" step="1" value="0" />s</span>
+              </div>
+              <div class="hint">0 = your original candles. Higher = fuller bodies, shorter wicks. Rebuilds the chart from the same seed.</div>
+            </div>
+          </li>
+          <li>
+            <span class="n">4</span>
+            <div>
+              <div class="row"><span class="k">New price</span><span class="v" id="move">—</span></div>
+              <div class="hint">price × e<sup>volatility × shock</sup>, rounded to 5 decimals.</div>
+            </div>
+          </li>
+          <li>
+            <span class="n">5</span>
+            <div>
+              <div class="row"><span class="k">Into the candle</span><span class="v" id="tickpos">—</span></div>
+              <div class="hint" id="effect">—</div>
+            </div>
+          </li>
+        </ol>
+      </section>
+
+      <section>
+        <h2 id="forming-title">Forming candle</h2>
+        <div class="anatomy">
+          <svg id="candle-svg" width="150" height="200" viewBox="0 0 150 200" aria-label="The forming candle"></svg>
+          <div>
+            <dl class="ohlc">
+              <dt>Open</dt><dd id="o">—</dd>
+              <dt>High</dt><dd id="h">—</dd>
+              <dt>Low</dt><dd id="l">—</dd>
+              <dt>Close</dt><dd id="c">—</dd>
+            </dl>
+            <div class="split" id="split"></div>
+            <div class="legend"><span>upper wick</span><span>body</span><span>lower wick</span></div>
+          </div>
+        </div>
+        <div class="hint" style="margin-top:10px">Open = first tick in the bucket · High/Low = most extreme ticks · Close = latest tick. When the clock crosses the bucket boundary the candle closes and a new one opens.</div>
+      </section>
+
+      <section>
+        <h2>Open positions</h2>
+        <ul class="positions" id="open-positions"></ul>
+      </section>
+
+      <section>
+        <h2>Recent settlements</h2>
+        <ul class="positions settled" id="settled-positions"></ul>
+      </section>
+
+      <section>
+        <h2>Event log</h2>
+        <ul id="log"></ul>
+      </section>
+    </aside>
+  </main>
+
+  <script type="module" src="/client.js"></script>
+</body>
+</html>

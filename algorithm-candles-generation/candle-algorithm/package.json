@@ -1,0 +1,23 @@
+{
+  "name": "candle-algorithm",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Candle-generation algorithm. Install and run it on its own.",
+  "type": "module",
+  "scripts": {
+    "example": "tsx example.ts",
+    "example:fast": "tsx example-fast.ts",
+    "example:magnet": "tsx example-magnet.ts",
+    "live": "tsx live/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.2",
+    "esbuild": "0.23.1",
+    "tsx": "4.19.2",
+    "typescript": "5.6.3"
+  },
+  "dependencies": {
+    "lightweight-charts": "5.2.1"
+  }
+}

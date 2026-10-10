@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "candle-live",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "candle-algorithm", "run", "live"],
+      "port": 5180
+    }
+  ]
+}
