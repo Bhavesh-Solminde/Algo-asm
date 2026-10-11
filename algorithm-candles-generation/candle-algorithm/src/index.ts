@@ -23,6 +23,18 @@ export {
 } from "./intraday";
 export { stepNews, newsVarianceFactor, withNews, type NewsParams } from "./news";
 export {
+  Economy,
+  DEFAULT_ECONOMY,
+  DAILY_REWARD,
+  DAILY_HOUSE_TARGET,
+  breakEvenWinRate,
+  dayOf,
+  type EconomyConfig,
+  type EconomyStats,
+  type Outcome,
+  type PlayerAccount,
+} from "./economy";
+export {
   GAME_MARKETS,
   MARKET_NEWS,
   findMarket,

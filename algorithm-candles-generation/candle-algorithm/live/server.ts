@@ -27,6 +27,9 @@ import {
   AssetRegistry,
   blendedMagnet,
   commitSnap,
+  DEFAULT_ECONOMY,
+  Economy,
+  breakEvenWinRate,
   GAME_MARKETS,
   intradayFactor,
   longRunSigma,
@@ -37,7 +40,9 @@ import {
   pickStyle,
   TIMEFRAME_SEC,
   type Candle,
+  type EconomyStats,
   type GameMarket,
+  type Outcome,
   type LiveAsset,
   type MarketGroup,
   type PathStyle,
@@ -66,8 +71,8 @@ const MAX_FRAMES_PER_SEC = 60;
 // How often the market list's prices refresh, in real milliseconds.
 const QUOTES_EVERY_MS = 500;
 const TRADE_DURATIONS_SEC = [30, 60, 120] as const;
-/** Stake choices, in hamoud. */
-const STAKES = [10, 50, 100, 500] as const;
+/** Stake choices, in hamoud (src/economy.ts). */
+const STAKES = DEFAULT_ECONOMY.stakes;
 const MAX_SETTLED_KEPT = 20;
 // A planned trade's target sits this many standard deviations of the
 // trade-length move away from entry — about where the original fixed 5-pip
@@ -85,8 +90,30 @@ export interface Settings {
   readonly speed: number;
   readonly persistence: number;
   readonly paused: boolean;
-  /** Game setting: probability a new trade is planned as a WIN. */
-  readonly winRate: number;
+  /**
+   * Probability a new trade is planned as a WIN. `null` hands the choice to
+   * the economy controller, which is the real game; a fixed number is a demo
+   * override for watching the steering work.
+   */
+  readonly winRate: number | null;
+  /** A winning trade returns stake × (1 + payoutRate). */
+  readonly payoutRate: number;
+  readonly stakes: readonly number[];
+}
+
+/** One player's purse. Each browser gets its own. */
+export interface Wallet {
+  readonly type: "wallet";
+  readonly playerId: string;
+  readonly balance: number;
+  readonly canClaim: boolean;
+  /** Game seconds until the next daily top-up. */
+  readonly nextRewardSec: number;
+  readonly dailyReward: number;
+  readonly stakedToday: number;
+  readonly netToday: number;
+  readonly tradesToday: number;
+  readonly winsToday: number;
 }
 
 /** What the page needs to list and format a market. */
@@ -136,6 +163,8 @@ export interface TickDetail {
 export interface TradeView {
   readonly id: string;
   readonly market: string;
+  /** Whose trade it is — the game only shows you your own. */
+  readonly player: string;
   readonly direction: "UP" | "DOWN";
   /** The result the game picked when the trade opened; the chart is steered toward it. */
   readonly planned: "WIN" | "LOSS";
@@ -144,13 +173,18 @@ export interface TradeView {
   readonly targetPrice: number;
   readonly entrySec: number;
   readonly expirySec: number;
-  /** Stake in hamoud. Nothing is paid out either way. */
+  /** Stake in hamoud, already taken from the player's balance. */
   readonly stake: number;
+  /** What a win would return: stake × (1 + payoutRate). */
+  readonly toReturn: number;
 }
 
 export interface SettledTradeView extends TradeView {
   readonly exitPrice: number;
-  readonly outcome: "WIN" | "LOSS";
+  /** TIE = the price landed exactly on entry; the stake is refunded. */
+  readonly outcome: Outcome;
+  /** Hamoud credited back: the full return on a win, the stake on a tie, 0 on a loss. */
+  readonly credited: number;
 }
 
 export type DemoMessage =
@@ -159,6 +193,8 @@ export type DemoMessage =
   | { type: "settings"; settings: Settings; stampSec: number; layerSecs: number[] }
   | { type: "markets"; markets: MarketInfo[] }
   | { type: "quotes"; quotes: Quote[] }
+  | Wallet
+  | { type: "economy"; stats: EconomyStats; breakEven: number }
   | { type: "reset" }
   | { type: "trades:snapshot"; open: TradeView[]; settled: SettledTradeView[] }
   | { type: "trade:open"; trade: TradeView }
@@ -167,15 +203,18 @@ export type DemoMessage =
 interface LiveTrade extends StampedTrade {
   readonly id: string;
   readonly market: string;
+  readonly playerId: string;
   readonly direction: "UP" | "DOWN";
   readonly planned: "WIN" | "LOSS";
   readonly entryPrice: number;
+  readonly toReturn: number;
 }
 
 /** Messages produced by one or more ticks: some for everyone, some per market. */
 class Frame {
   readonly global: DemoMessage[] = [];
   readonly byMarket = new Map<string, DemoMessage[]>();
+  readonly byPlayer = new Map<string, DemoMessage[]>();
 
   constructor(private readonly watched: ReadonlySet<string>) {}
 
@@ -184,6 +223,13 @@ class Frame {
     if (!this.watched.has(id)) return null;
     let list = this.byMarket.get(id);
     if (!list) this.byMarket.set(id, (list = []));
+    return list;
+  }
+
+  /** Messages only this player should see — their own trades and wallet. */
+  forPlayer(id: string): DemoMessage[] {
+    let list = this.byPlayer.get(id);
+    if (!list) this.byPlayer.set(id, (list = []));
     return list;
   }
 }
@@ -287,8 +333,15 @@ class MarketSim {
           stillOpen.push(t);
           continue;
         }
-        const won = t.direction === "UP" ? shownPrice > t.entryPrice : shownPrice < t.entryPrice;
-        settled.push({ ...toView(t), exitPrice: shownPrice, outcome: won ? "WIN" : "LOSS" });
+        // A tie — the price landing exactly on entry — is common on markets
+        // with a coarse tick, so it refunds rather than counting as a loss.
+        const outcome: Outcome =
+          shownPrice === t.entryPrice
+            ? "TIE"
+            : (shownPrice > t.entryPrice) === (t.direction === "UP")
+              ? "WIN"
+              : "LOSS";
+        settled.push({ ...toView(t), exitPrice: shownPrice, outcome, credited: 0 });
       }
       this.open = stillOpen;
     }
@@ -326,8 +379,16 @@ class Simulation {
     speed: 10,
     persistence: DEFAULT_PERSISTENCE.msm,
     paused: false,
-    winRate: 0.5,
+    winRate: null,
+    payoutRate: DEFAULT_ECONOMY.payoutRate,
+    stakes: STAKES,
   };
+  /**
+   * The hamoud ledger. Survives chart rebuilds — restarting the markets must
+   * not wipe anyone's balance — and runs on the GAME clock, so "Skip ahead"
+   * rolls the day over and the daily top-up comes round again.
+   */
+  readonly economy = new Economy(Math.floor(Date.now() / 1000), DEFAULT_ECONOMY);
 
   constructor(
     private readonly emit: (frame: Frame) => void,
@@ -348,32 +409,77 @@ class Simulation {
     this.schedule();
   }
 
-  tradesSnapshot(): DemoMessage {
+  /** This player's own open and settled trades. */
+  tradesSnapshot(playerId: string): DemoMessage {
     return {
       type: "trades:snapshot",
-      open: [...this.sims.values()].flatMap((s) => s.open.map(toView)),
-      settled: this.settled,
+      open: [...this.sims.values()].flatMap((s) =>
+        s.open.filter((t) => t.playerId === playerId).map(toView),
+      ),
+      settled: this.settled.filter((t) => t.player === playerId),
     };
+  }
+
+  wallet(playerId: string): Wallet {
+    const account = this.economy.account(playerId);
+    return {
+      type: "wallet",
+      playerId,
+      balance: account.balance,
+      canClaim: this.economy.canClaim(playerId),
+      nextRewardSec: this.economy.secondsToNextReward(this.simSec),
+      dailyReward: this.economy.config.dailyReward,
+      stakedToday: account.stakedToday,
+      netToday: account.netToday,
+      tradesToday: account.tradesToday,
+      winsToday: account.winsToday,
+    };
+  }
+
+  economyMessage(): DemoMessage {
+    return {
+      type: "economy",
+      stats: this.economy.stats(),
+      breakEven: breakEvenWinRate(this.economy.config),
+    };
+  }
+
+  /** Hand out the daily top-up. Returns how much was added. */
+  claim(playerId: string): number {
+    this.economy.tick(this.simSec);
+    return this.economy.claimDailyReward(playerId);
   }
 
   quotes(): DemoMessage {
     return { type: "quotes", quotes: [...this.sims.values()].map((s) => s.quote(this.simSec)) };
   }
 
-  openTrade(marketId: string, direction: "UP" | "DOWN", durationSec: number, stake: number): string | null {
+  openTrade(
+    playerId: string,
+    marketId: string,
+    direction: "UP" | "DOWN",
+    durationSec: number,
+    stake: number,
+  ): string | null {
     const sim = this.sims.get(marketId);
     if (!sim) return "unknown market";
     if (!TRADE_DURATIONS_SEC.includes(durationSec as (typeof TRADE_DURATIONS_SEC)[number])) {
       return `durationSec must be one of ${TRADE_DURATIONS_SEC}`;
     }
-    if (!STAKES.includes(stake as (typeof STAKES)[number])) return `stake must be one of ${STAKES}`;
+    if (!STAKES.includes(stake)) return `stake must be one of ${STAKES}`;
+    if (!this.economy.placeStake(playerId, stake)) return "not enough hamoud";
     const { market } = sim;
     const entryPrice = sim.lastPrice;
     // The game picks the result now: WIN places the target on the player's side
     // (the magnet drags the chart in their favour); LOSS places it on the
     // opposite side. From the engine's point of view both are stamped
     // non-HONEST trades — the magnet just pulls toward the target.
-    const planned = this.tradeRng() < this.settings.winRate ? "WIN" : "LOSS";
+    //
+    // The win rate comes from the economy controller, which is reading the
+    // day's ledger and steering the hamoud supply (src/economy.ts). The
+    // demo override replaces it with a fixed number.
+    const winRate = this.settings.winRate ?? this.economy.winRateFor(playerId);
+    const planned = this.tradeRng() < winRate ? "WIN" : "LOSS";
     const sigma = sim.registry.sigmaNow(market.id, this.simSec);
     const offset = Math.max(market.tickSize, TARGET_SIGMAS * entryPrice * sigma * Math.sqrt(durationSec));
     const towardWin = direction === "UP" ? offset : -offset;
@@ -382,9 +488,11 @@ class Simulation {
     const trade: LiveTrade = {
       id: `t${++this.tradeSeq}`,
       market: market.id,
+      playerId,
       direction,
       planned,
       entryPrice,
+      toReturn: stake * (1 + this.economy.config.payoutRate),
       verdict: "WIN",
       pathStyle: pickStyle(durationSec, this.tradeRng),
       targetPrice,
@@ -394,7 +502,7 @@ class Simulation {
     };
     sim.open.push(trade);
     const frame = new Frame(new Set());
-    frame.global.push({ type: "trade:open", trade: toView(trade) });
+    frame.forPlayer(playerId).push({ type: "trade:open", trade: toView(trade) });
     this.emit(frame);
     return null;
   }
@@ -454,14 +562,19 @@ class Simulation {
 
   private step(frame: Frame | null): void {
     this.simSec += STAMP_SEC;
+    // Rolling into a new game day resets the ledger's daily counters and
+    // makes the top-up available again.
+    this.economy.tick(this.simSec);
     const settled: SettledTradeView[] = [];
     for (const sim of this.sims.values()) {
       sim.step(this.simSec, frame?.forMarket(sim.market.id) ?? null, settled);
     }
     for (const trade of settled) {
-      this.settled.unshift(trade);
+      const credited = this.economy.settle(trade.player, trade.stake, trade.outcome);
+      const paid = { ...trade, credited };
+      this.settled.unshift(paid);
       if (this.settled.length > MAX_SETTLED_KEPT) this.settled.pop();
-      frame?.global.push({ type: "trade:settle", trade });
+      frame?.forPlayer(trade.player)?.push({ type: "trade:settle", trade: paid });
     }
   }
 }
@@ -470,7 +583,9 @@ function toView(t: LiveTrade): TradeView {
   return {
     id: t.id,
     market: t.market,
+    player: t.playerId,
     direction: t.direction,
+    toReturn: t.toReturn,
     planned: t.planned,
     pathStyle: t.pathStyle!,
     entryPrice: t.entryPrice,
@@ -495,8 +610,12 @@ const MARKETS: MarketInfo[] = GAME_MARKETS.map((m) => ({
 // Every market shares the same MSM layer timescales.
 const LAYER_SECS = msmDurations(marketMsm(GAME_MARKETS[0]!));
 
-/** Open event streams, each with the market it is watching. */
-const clients = new Map<ServerResponse, string>();
+/** Open event streams, each with the market it watches and the player behind it. */
+interface Client {
+  market: string;
+  readonly playerId: string;
+}
+const clients = new Map<ServerResponse, Client>();
 const send = (res: ServerResponse, frame: DemoMessage[]): void => {
   res.write(`data: ${JSON.stringify(frame)}\n\n`);
 };
@@ -504,9 +623,28 @@ const broadcast = (frame: DemoMessage[]): void => {
   for (const res of clients.keys()) send(res, frame);
 };
 const deliver = (frame: Frame): void => {
-  for (const [res, market] of clients) {
-    const messages = [...(frame.byMarket.get(market) ?? []), ...frame.global];
+  for (const [res, client] of clients) {
+    const messages = [
+      ...(frame.byMarket.get(client.market) ?? []),
+      ...(frame.byPlayer.get(client.playerId) ?? []),
+      ...frame.global,
+    ];
     if (messages.length > 0) send(res, messages);
+  }
+};
+/** Wallets are per player, so each stream gets its own copy. */
+const broadcastWallets = (extra: DemoMessage[]): void => {
+  for (const [res, client] of clients) send(res, [...extra, sim.wallet(client.playerId)]);
+};
+/** After a rebuild: everyone reloads, and each player gets their own trades. */
+const broadcastSnapshots = (): void => {
+  for (const [res, client] of clients) {
+    send(res, [
+      { type: "reset" },
+      sim.tradesSnapshot(client.playerId),
+      sim.quotes(),
+      sim.wallet(client.playerId),
+    ]);
   }
 };
 const settingsMessage = (): DemoMessage => ({
@@ -517,12 +655,12 @@ const settingsMessage = (): DemoMessage => ({
 });
 
 const startedAt = Date.now();
-const sim = new Simulation(deliver, () => new Set(clients.values()));
+const sim = new Simulation(deliver, () => new Set([...clients.values()].map((c) => c.market)));
 console.log(
   `generated ${HISTORY_MINUTES / 60}h of history for ${GAME_MARKETS.length} markets in ${Date.now() - startedAt}ms`,
 );
 setInterval(() => {
-  if (clients.size > 0) broadcast([sim.quotes()]);
+  if (clients.size > 0) broadcastWallets([sim.quotes(), sim.economyMessage()]);
 }, QUOTES_EVERY_MS);
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -536,7 +674,7 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
   }
 }
 
-function handleControl(cmd: Record<string, unknown>): string | null {
+function handleControl(cmd: Record<string, unknown>, playerId: string): string | null {
   switch (cmd.action) {
     case "pause":
       sim.update({ paused: true });
@@ -549,13 +687,13 @@ function handleControl(cmd: Record<string, unknown>): string | null {
       break;
     case "restart":
       sim.restart();
-      broadcast([{ type: "reset" }, sim.tradesSnapshot(), sim.quotes()]);
+      broadcastSnapshots();
       break;
     case "skip": {
       const minutes = Number(cmd.minutes);
       if (!(minutes > 0 && minutes <= 24 * 60)) return "minutes must be between 1 and 1440";
       sim.advance((minutes * 60) / STAMP_SEC);
-      broadcast([{ type: "reset" }, sim.tradesSnapshot(), sim.quotes()]);
+      broadcastSnapshots();
       break;
     }
     case "speed": {
@@ -570,26 +708,40 @@ function handleControl(cmd: Record<string, unknown>): string | null {
         return `persistence must be between 0 and ${MAX_PERSISTENCE_SEC}`;
       }
       sim.update({ persistence });
-      broadcast([{ type: "reset" }, sim.tradesSnapshot(), sim.quotes()]);
+      broadcastSnapshots();
       break;
     }
     case "model": {
       const model = cmd.value;
       if (model !== "msm" && model !== "garch") return "model must be msm or garch";
       sim.update({ model });
-      broadcast([{ type: "reset" }, sim.tradesSnapshot(), sim.quotes()]);
+      broadcastSnapshots();
       break;
     }
     case "trade": {
       const direction = cmd.direction;
       if (direction !== "UP" && direction !== "DOWN") return "direction must be UP or DOWN";
-      // Settings didn't change, so skip the trailing broadcast.
-      return sim.openTrade(String(cmd.market), direction, Number(cmd.durationSec), Number(cmd.stake));
+      const error = sim.openTrade(
+        playerId,
+        String(cmd.market),
+        direction,
+        Number(cmd.durationSec),
+        Number(cmd.stake),
+      );
+      // Settings didn't change; the wallet did.
+      if (!error) broadcastWallets([]);
+      return error;
+    }
+    case "claim": {
+      sim.claim(playerId);
+      broadcastWallets([]);
+      return null;
     }
     case "winRate": {
-      const winRate = Number(cmd.value);
-      if (!(WIN_RATE_OPTIONS as readonly number[]).includes(winRate)) {
-        return `winRate must be one of ${WIN_RATE_OPTIONS}`;
+      const raw = cmd.value;
+      const winRate = raw === "auto" || raw === null ? null : Number(raw);
+      if (winRate !== null && !(WIN_RATE_OPTIONS as readonly number[]).includes(winRate)) {
+        return `winRate must be "auto" or one of ${WIN_RATE_OPTIONS}`;
       }
       sim.update({ winRate });
       break;
@@ -627,17 +779,20 @@ const server = createServer(async (req, res) => {
       // An unknown market still gets the stream — the page falls back to a
       // real one once it sees the market list.
       const market = url.searchParams.get("market") ?? "";
+      const playerId = url.searchParams.get("player") || `anon-${Math.random().toString(36).slice(2)}`;
       res.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
         connection: "keep-alive",
       });
-      clients.set(res, market);
+      clients.set(res, { market, playerId });
       send(res, [
         settingsMessage(),
         { type: "markets", markets: MARKETS },
         sim.quotes(),
-        sim.tradesSnapshot(),
+        sim.economyMessage(),
+        sim.wallet(playerId),
+        sim.tradesSnapshot(playerId),
       ]);
       req.on("close", () => clients.delete(res));
       return;
@@ -658,7 +813,8 @@ const server = createServer(async (req, res) => {
       return;
     }
     if (req.method === "POST" && url.pathname === "/control") {
-      const error = handleControl(await readJson(req));
+      const body = await readJson(req);
+      const error = handleControl(body, String(body.player ?? ""));
       res.writeHead(error ? 400 : 204).end(error ?? undefined);
       return;
     }
