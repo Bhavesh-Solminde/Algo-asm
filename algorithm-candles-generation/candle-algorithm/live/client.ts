@@ -30,12 +30,31 @@ import type {
   Settings,
   TickDetail,
   TradeView,
+  Wallet,
 } from "./server";
+import type { EconomyStats } from "../src/economy";
 
 const DEFAULT_MARKET = "BOT-BUKT";
 const SPARK_POINTS = 240;
 const LOG_LINES = 40;
 const NOTICE_KEY = "market-sim-notice-ack";
+const PLAYER_KEY = "market-sim-player";
+
+/**
+ * This browser's player id. Hamoud balances hang off it, so it is kept in
+ * localStorage — clear it and you are a new player with an empty purse.
+ */
+const playerId = ((): string => {
+  try {
+    const saved = localStorage.getItem(PLAYER_KEY);
+    if (saved) return saved;
+    const made = `p-${Math.random().toString(36).slice(2, 10)}`;
+    localStorage.setItem(PLAYER_KEY, made);
+    return made;
+  } catch {
+    return `p-${Math.random().toString(36).slice(2, 10)}`;
+  }
+})();
 
 const $ = <T extends Element = HTMLElement>(sel: string): T => {
   const el = document.querySelector<T>(sel);
@@ -123,7 +142,18 @@ function paintBar(c: Candle): void {
 let marketId = location.hash.slice(1) || DEFAULT_MARKET;
 let timeframe: Timeframe = "1m";
 let state: ChartState = initialChartState(marketId, timeframe);
-let settings: Settings = { model: "msm", speed: 10, persistence: 4, paused: false, winRate: 0.5 };
+let settings: Settings = {
+  model: "msm",
+  speed: 10,
+  persistence: 4,
+  paused: false,
+  winRate: null,
+  payoutRate: 0.45,
+  stakes: [10, 50, 100, 500],
+};
+let wallet: Wallet | null = null;
+let economy: EconomyStats | null = null;
+let breakEven = 0.69;
 let stampSec = 1;
 let layerSecs: number[] = [];
 let markets: MarketInfo[] = [];
@@ -187,7 +217,9 @@ function selectMarket(id: string): void {
   lastDetail = null;
   lastEffect = "—";
   events?.close();
-  events = new EventSource(`/events?market=${encodeURIComponent(id)}`);
+  events = new EventSource(
+    `/events?market=${encodeURIComponent(id)}&player=${encodeURIComponent(playerId)}`,
+  );
   events.onmessage = (e: MessageEvent<string>) => handleFrame(JSON.parse(e.data) as DemoMessage[]);
   events.onerror = () => {
     $("#stats").textContent = "disconnected — is the server running?";
@@ -225,6 +257,7 @@ function handleFrame(frame: DemoMessage[]): void {
     switch (msg.type) {
       case "settings":
         settings = msg.settings;
+        renderStakeOptions(msg.settings.stakes);
         stampSec = msg.stampSec;
         layerSecs = msg.layerSecs;
         renderControls();
@@ -241,6 +274,14 @@ function handleFrame(frame: DemoMessage[]): void {
       case "quotes":
         for (const q of msg.quotes) quotes.set(q.id, q);
         renderQuotes();
+        break;
+      case "wallet":
+        wallet = msg;
+        renderWallet();
+        break;
+      case "economy":
+        economy = msg.stats;
+        breakEven = msg.breakEven;
         break;
       case "reset":
         volHistory.length = 0;
@@ -292,7 +333,7 @@ function handleFrame(frame: DemoMessage[]): void {
         openTrades = [...openTrades, msg.trade];
         addPriceLines(msg.trade);
         log(
-          `TRADE OPEN  ${nameOf(msg.trade.market)} ${msg.trade.direction}  entry ${fmt(msg.trade.entryPrice, msg.trade.market)}  ${msg.trade.stake} hamoud` +
+          `TRADE OPEN  ${nameOf(msg.trade.market)} ${msg.trade.direction}  entry ${fmt(msg.trade.entryPrice, msg.trade.market)}  −${msg.trade.stake} hamoud (wins ${Math.round(msg.trade.toReturn)})` +
             (showInternals ? `  [planned ${msg.trade.planned} · ${msg.trade.pathStyle}]` : ""),
           true,
         );
@@ -302,7 +343,7 @@ function handleFrame(frame: DemoMessage[]): void {
         settledTrades = [msg.trade, ...settledTrades].slice(0, 20);
         removePriceLines(msg.trade.id);
         log(
-          `TRADE ${msg.trade.outcome}  ${nameOf(msg.trade.market)} ${msg.trade.direction}  exit ${fmt(msg.trade.exitPrice, msg.trade.market)}`,
+          `TRADE ${msg.trade.outcome}  ${nameOf(msg.trade.market)} ${msg.trade.direction}  exit ${fmt(msg.trade.exitPrice, msg.trade.market)}  ${msg.trade.credited > 0 ? `+${Math.round(msg.trade.credited)}` : "−0"} hamoud`,
           true,
         );
         break;
@@ -376,7 +417,7 @@ async function control(body: Record<string, unknown>): Promise<void> {
   const res = await fetch("/control", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ ...body, player: playerId }),
   });
   if (!res.ok) log(`control failed: ${await res.text()}`, true);
 }
@@ -413,10 +454,13 @@ for (const btn of document.querySelectorAll<HTMLButtonElement>(".dir")) {
   });
 }
 for (const btn of document.querySelectorAll<HTMLButtonElement>("#winrate button")) {
-  btn.addEventListener("click", () =>
-    void control({ action: "winRate", value: Number(btn.dataset.winrate) }),
-  );
+  btn.addEventListener("click", () => {
+    const raw = btn.dataset.winrate!;
+    void control({ action: "winRate", value: raw === "auto" ? "auto" : Number(raw) });
+  });
 }
+$("#claim").addEventListener("click", () => void control({ action: "claim" }));
+$<HTMLSelectElement>("#trade-stake").addEventListener("change", () => renderWallet());
 $<HTMLInputElement>("#internals").addEventListener("change", (e) => {
   showInternals = (e.target as HTMLInputElement).checked;
   document.body.classList.toggle("hide-internals", !showInternals);
@@ -448,7 +492,11 @@ function renderControls(): void {
   };
   press("#tf button", (b) => b.dataset.tf === timeframe);
   press("#speed button", (b) => Number(b.dataset.speed) === settings.speed);
-  press("#winrate button", (b) => Number(b.dataset.winrate) === settings.winRate);
+  press("#winrate button", (b) =>
+    b.dataset.winrate === "auto"
+      ? settings.winRate === null
+      : Number(b.dataset.winrate) === settings.winRate,
+  );
   press("#model button", (b) => b.dataset.model === settings.model);
   $("#pause").textContent = settings.paused ? "Resume" : "Pause";
   $("#pause").setAttribute("aria-pressed", String(settings.paused));
@@ -461,6 +509,69 @@ function renderControls(): void {
     settings.model === "msm"
       ? "8 layers multiply together. Each flips between high and low now and then, the slowest every few days, the fastest every second, so calm and busy spells nest inside each other like real markets. Time of day scales it up at the busy hours, and a rare news shock adds a surge that fades over ~10 minutes."
       : "GARCH: big shocks raise volatility for the next few ticks, then it fades back within seconds. Calm and busy spells barely last, so longer charts look like even noise.";
+}
+
+// ---- purse and economy ---------------------------------------------------
+
+const hamoud = (x: number): string => Math.round(x).toLocaleString("en-US");
+
+function renderWallet(): void {
+  if (!wallet) return;
+  $("#balance").textContent = hamoud(wallet.balance);
+  const claim = $<HTMLButtonElement>("#claim");
+  claim.disabled = !wallet.canClaim;
+  if (wallet.canClaim) {
+    claim.textContent = `Claim ${hamoud(wallet.dailyReward)}`;
+    claim.title = `Tops your balance up to ${hamoud(wallet.dailyReward)} hamoud`;
+  } else {
+    const hrs = Math.max(0, wallet.nextRewardSec) / 3600;
+    claim.textContent = hrs >= 1 ? `Next in ${hrs.toFixed(0)}h` : `Next in ${(hrs * 60).toFixed(0)}m`;
+    claim.title = "Already topped up today. Skip ahead to roll the game day over.";
+  }
+  // Can they afford the selected stake?
+  const stake = Number($<HTMLSelectElement>("#trade-stake").value);
+  const broke = wallet.balance < stake;
+  for (const b of document.querySelectorAll<HTMLButtonElement>(".dir")) b.disabled = broke;
+  $("#trade-hint").textContent = broke
+    ? `Not enough hamoud for a ${hamoud(stake)} stake — pick a smaller one, or claim your daily top-up.`
+    : `UP wins if the price ends above your entry, DOWN if it ends below. A win returns ${hamoud(stake * (1 + settings.payoutRate))}.`;
+}
+
+/** Stake choices come from the economy config, so they stay in step with it. */
+function renderStakeOptions(stakes: readonly number[]): void {
+  const select = $<HTMLSelectElement>("#trade-stake");
+  if (select.options.length === stakes.length) return;
+  const current = Number(select.value);
+  select.replaceChildren(
+    ...stakes.map((v) => {
+      const o = document.createElement("option");
+      o.value = String(v);
+      o.textContent = `${hamoud(v)} hamoud`;
+      o.selected = v === current;
+      return o;
+    }),
+  );
+}
+
+function renderEconomy(): void {
+  const e = economy;
+  if (!e) return;
+  const goal = e.issuedToday;
+  const share = goal > 0 ? e.houseNetToday / goal : 0;
+  $("#eco-progress").textContent = `${hamoud(e.houseNetToday)} / ${hamoud(goal)} (${(100 * share).toFixed(0)}%)`;
+  const fill = $("#eco-fill");
+  // The meter is drawn to 150% of the goal so overshoot is visible too.
+  fill.style.width = `${Math.min(100, (100 * share) / 1.5)}%`;
+  fill.style.background = share > 1.1 ? "var(--down)" : share > 0.85 ? "var(--up)" : "var(--accent)";
+  $("#eco-issued").textContent = hamoud(goal);
+  $("#eco-staked").textContent = hamoud(e.stakedToday);
+  $("#eco-paid").textContent = hamoud(e.paidOutToday);
+  $("#eco-net").textContent = hamoud(e.houseNetToday);
+  $("#eco-players").textContent = String(e.players);
+  $("#eco-win").textContent =
+    e.decidedToday > 0 ? `${(100 * e.realisedWinRate).toFixed(0)}% of ${e.decidedToday}` : "—";
+  $("#eco-next").textContent = `${(100 * e.nextWinRate).toFixed(0)}% (break-even ${(100 * breakEven).toFixed(0)}%)`;
+  $("#eco-supply").textContent = hamoud(e.supply);
 }
 
 // ---- market list --------------------------------------------------------
@@ -594,6 +705,8 @@ function renderPanel(): void {
   $("#stats").textContent = `SIMULATED · ${state.candles.length} closed ${timeframe} candles · body averages ${body.toFixed(0)}% of range`;
 
   renderPositions();
+  renderWallet();
+  renderEconomy();
 
   const ul = $("#log");
   ul.replaceChildren(
@@ -647,7 +760,7 @@ function renderPositions(): void {
         li.innerHTML =
           `<div class="pos-head"><span class="pos-mkt"></span><span class="pos-dir ${t.direction.toLowerCase()}">${t.direction} ${arrow}</span>` +
           `<span class="pos-countdown">${t.market === marketId ? `${left}s left` : "running"}</span></div>` +
-          `<div class="pos-prices">entry ${fmt(t.entryPrice, t.market)} · stake ${t.stake} hamoud</div>` +
+          `<div class="pos-prices">entry ${fmt(t.entryPrice, t.market)} · stake ${hamoud(t.stake)} → wins ${hamoud(t.toReturn)}</div>` +
           `<div class="pos-style internal">planned ${t.planned} · target ${fmt(t.targetPrice, t.market)} · ${t.pathStyle} path</div>` +
           `<div class="pos-progress"><div class="fill" style="width:${t.market === marketId ? progressPct.toFixed(1) : 0}%"></div></div>`;
         li.querySelector(".pos-mkt")!.textContent = nameOf(t.market);
@@ -665,8 +778,8 @@ function renderPositions(): void {
         const li = document.createElement("li");
         li.innerHTML =
           `<div class="pos-head"><span class="pos-mkt"></span><span class="pos-dir ${t.direction.toLowerCase()}">${t.direction} ${t.direction === "UP" ? "▲" : "▼"}</span>` +
-          `<span class="outcome ${t.outcome.toLowerCase()}">${t.outcome}</span></div>` +
-          `<div class="pos-prices">entry ${fmt(t.entryPrice, t.market)}  →  exit ${fmt(t.exitPrice, t.market)} · ${t.stake} hamoud, nothing paid</div>` +
+          `<span class="outcome ${t.outcome.toLowerCase()}">${t.outcome} ${t.credited >= t.stake ? "+" : "−"}${hamoud(Math.abs(t.credited - t.stake))}</span></div>` +
+          `<div class="pos-prices">entry ${fmt(t.entryPrice, t.market)}  →  exit ${fmt(t.exitPrice, t.market)} · staked ${hamoud(t.stake)}, back ${hamoud(t.credited)}</div>` +
           `<div class="pos-style internal">planned ${t.planned}${t.planned === t.outcome ? "" : " — steering missed"} · ${t.pathStyle} path</div>`;
         li.querySelector(".pos-mkt")!.textContent = nameOf(t.market);
         return li;

@@ -53,6 +53,23 @@
     .brand .sub { color: var(--muted); font-size: 11px; display: block; }
     .brand .price { font-family: var(--mono); font-size: 15px; font-weight: 600; margin-left: 8px; }
     .brand .chg { font-family: var(--mono); font-size: 12px; }
+    /* Purse */
+    .wallet-group { gap: 8px; }
+    .purse { display: grid; line-height: 1.15; }
+    .purse-amount { font-family: var(--mono); font-size: 16px; font-weight: 700; color: var(--accent); }
+    .purse-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+    .claim { background: #2a2060; border-color: #4a3a9a; color: #d7ceff; font-weight: 600; }
+    .claim:hover:not(:disabled) { background: #3a2d7a; }
+    .claim:disabled { background: var(--raised); border-color: var(--line); color: var(--faint); font-weight: 400; }
+
+    /* Economy panel */
+    .eco { display: grid; grid-template-columns: 1fr auto; gap: 3px 10px; font-size: 12px; }
+    .eco dt { color: var(--muted); }
+    .eco dd { margin: 0; font-family: var(--mono); text-align: right; }
+    .meter { position: relative; height: 8px; background: var(--raised); border-radius: 4px; overflow: hidden; margin: 8px 0 4px; }
+    .meter .fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--up); transition: width .3s; }
+    .meter .goal { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--text); }
+
     .sim-tag {
       font-size: 10px; font-weight: 700; letter-spacing: .08em; color: #d7ceff; background: #2a2060;
       border: 1px solid #4a3a9a; border-radius: 4px; padding: 1px 5px;
@@ -246,7 +263,7 @@
 </head>
 <body>
   <div class="sim-banner" role="note">
-    <span><strong>SIMULATED GAME</strong> · every market is fictional · prices are computer-generated, not a real market · stakes are hamoud coins with no cash value, nothing is paid out</span>
+    <span><strong>SIMULATED GAME</strong> · every market is fictional · prices are computer-generated, not a real market · stakes are hamoud coins with no cash value</span>
     <button id="notice-open" type="button">Read the notice</button>
   </div>
 
@@ -260,6 +277,14 @@
       <span class="price" id="m-price">—</span>
       <span class="chg" id="m-chg"></span>
       <span class="clock" id="clock" title="Game clock (UTC)">--:--:--</span>
+    </div>
+
+    <div class="group wallet-group">
+      <div class="purse">
+        <span class="purse-amount" id="balance">—</span>
+        <span class="purse-label">hamoud · no cash value</span>
+      </div>
+      <button id="claim" class="claim" title="Daily top-up">Claim daily</button>
     </div>
 
     <div class="group">
@@ -328,7 +353,25 @@
           <button class="dir up" data-dir="UP" title="WIN if the price is above entry when time runs out">UP ▲</button>
           <button class="dir down" data-dir="DOWN" title="WIN if the price is below entry when time runs out">DOWN ▼</button>
         </div>
-        <div class="hint" style="margin-top:8px">UP wins if the price ends above your entry, DOWN if it ends below. Hamoud are game coins with no cash value. Nothing is paid out: the trade just ends as WIN or LOSS.</div>
+        <div class="hint" id="trade-hint" style="margin-top:8px">UP wins if the price ends above your entry, DOWN if it ends below.</div>
+        <div class="hint">Hamoud are game coins with no cash value — they cannot be bought, sold or withdrawn. A tie refunds your stake.</div>
+      </section>
+
+      <section>
+        <h2>Hamoud economy <span class="sim-tag">LIVE</span></h2>
+        <div class="row"><span class="k">Taken back today</span><span class="v" id="eco-progress">—</span></div>
+        <div class="meter"><div class="fill" id="eco-fill"></div><div class="goal" style="left:100%"></div></div>
+        <div class="hint" id="eco-note">The marker is today's goal: take back exactly what the daily top-ups handed out, so the hamoud supply stays flat.</div>
+        <dl class="eco" style="margin-top:10px">
+          <dt>Handed out today</dt><dd id="eco-issued">—</dd>
+          <dt>Staked today</dt><dd id="eco-staked">—</dd>
+          <dt>Paid out today</dt><dd id="eco-paid">—</dd>
+          <dt>House take</dt><dd id="eco-net">—</dd>
+          <dt>Players today</dt><dd id="eco-players">—</dd>
+          <dt>Win rate so far</dt><dd id="eco-win">—</dd>
+          <dt>Next trade planned at</dt><dd id="eco-next">—</dd>
+          <dt>Hamoud in circulation</dt><dd id="eco-supply">—</dd>
+        </dl>
       </section>
 
       <section>
@@ -336,12 +379,13 @@
         <div class="row">
           <span class="k">Win rate</span>
           <div class="seg" id="winrate">
+            <button data-winrate="auto" aria-pressed="true" title="The economy controller decides, to keep the hamoud supply flat">Auto</button>
             <button data-winrate="0.25">25%</button>
-            <button data-winrate="0.5" aria-pressed="true">50%</button>
+            <button data-winrate="0.5">50%</button>
             <button data-winrate="1">100%</button>
           </div>
         </div>
-        <div class="hint">The game picks each new trade's result with this chance of WIN, then steers the chart toward it.</div>
+        <div class="hint" id="winrate-hint">Auto lets the economy controller pick each trade's result. The fixed settings override it, for watching the steering work.</div>
         <label class="check"><input type="checkbox" id="internals" checked /> Show game internals (planned result, target line, steering)</label>
       </section>
 
@@ -456,7 +500,8 @@
       <ul>
         <li><strong>Every market is fictional.</strong> Names like RANK SHIFTY, NOGE/BUKT and ROO/BUK are made up. They don't track any real index, currency, metal or coin.</li>
         <li><strong>Prices are made by a computer model</strong> as you watch. They are not quotes and tell you nothing about any real market.</li>
-        <li><strong>Stakes are hamoud</strong>, the game's own coins. Hamoud have no cash value and can't be bought, sold or withdrawn. Nothing is paid out: a trade just ends as WIN or LOSS.</li>
+        <li><strong>Stakes are hamoud</strong>, the game's own coins. Hamoud have no cash value and cannot be bought, sold or withdrawn for anything — they are just a score. You are topped up to 1,000 of them each day.</li>
+        <li><strong>The game is built to take the hamoud back.</strong> Over a day the house wins back about what the daily top-ups handed out, so the average player ends up where they started. You can watch this happen in the Hamoud economy panel.</li>
         <li><strong>The game can decide results.</strong> The Win rate setting picks each trade's result in advance and steers the chart toward it, so results say nothing about skill or real markets.</li>
         <li>Everything in the game can be changed or reset at any time.</li>
       </ul>
