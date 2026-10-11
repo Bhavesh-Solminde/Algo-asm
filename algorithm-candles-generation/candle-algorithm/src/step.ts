@@ -1,10 +1,12 @@
 import { initGarch, stepGarch, type GarchParams, type GarchState } from "./garch";
+import type { MsmParams } from "./msm";
+import type { NewsParams } from "./news";
 
 /**
  * The four-layer tick composer.
  *
- *   L1 base      GBM with GARCH volatility and short-term momentum — the
- *                honest random walk
+ *   L1 base      GBM with GARCH or MSM volatility and short-term momentum —
+ *                the honest random walk
  *   L2 drift     a small bounded bias (Plan 04 supplies it; 0 here)
  *   L3 magnet    expiry convergence pull (Plan 04 supplies it; 0 here)
  *   L4 anchor    weak pull toward a real market price
@@ -14,7 +16,21 @@ import { initGarch, stepGarch, type GarchParams, type GarchState } from "./garch
  */
 
 export interface PriceParams {
-  readonly garch: GarchParams;
+  /** GARCH(1,1) volatility. Used when `msm` is not set. */
+  readonly garch?: GarchParams;
+  /**
+   * Markov-switching multifractal volatility (src/msm.ts). Takes precedence
+   * over `garch`. Its layers live on the asset (they never look at the price)
+   * and reach stepPrice through `volScale`.
+   */
+  readonly msm?: MsmParams;
+  /**
+   * 24 UTC-hour volatility multipliers (src/intraday.ts). Applied through
+   * `volScale` when the caller knows the tick's wall-clock time.
+   */
+  readonly intraday?: readonly number[];
+  /** Rare volatility spikes (src/news.ts). Applied through `volScale`. */
+  readonly news?: NewsParams;
   /** Deterministic drift per second, in log space. Usually 0. */
   readonly driftPerSec: number;
   /** Anchor strength per tick. 0 disables anchoring entirely. */
@@ -39,7 +55,8 @@ export interface PriceParams {
 
 export interface PriceState {
   readonly price: number;
-  readonly garch: GarchState;
+  /** GARCH variance state; null when the asset runs on MSM. */
+  readonly garch: GarchState | null;
   /** Unit-variance shock carried from the previous tick (the momentum term). */
   readonly momentum: number;
 }
@@ -50,6 +67,12 @@ export interface StepPriceInput {
   readonly dtSec: number;
   /** Standard normal draw for this tick. */
   readonly z: number;
+  /**
+   * Exogenous volatility multiplier for this tick — MSM layers × intraday
+   * factor. Computed once per asset by the caller so the shown and honest
+   * paths share it. Defaults to 1.
+   */
+  readonly volScale?: number;
   /** Layer 2. Log-space bias. Plan 04 bounds this to ±0.25·sigma. */
   readonly driftBias: number;
   /** Layer 3. Log-space pull toward an expiry target. */
@@ -92,6 +115,18 @@ export function perTickSigma(sigma: number, dtSec: number = TICK_DT_SEC): number
   return sigma * Math.sqrt(dtSec);
 }
 
+/** The volatility per √second this asset settles at in the long run. */
+export function longRunSigma(params: PriceParams): number {
+  if (params.msm) return params.msm.sigma;
+  const g = params.garch!;
+  return Math.sqrt(g.omega / (1 - g.alpha - g.beta));
+}
+
+/** Volatility per √second before `volScale` — GARCH's conditional level, or MSM's sigma. */
+export function baseSigma(state: PriceState, params: PriceParams): number {
+  return params.msm ? params.msm.sigma : Math.sqrt(state.garch!.sigma2);
+}
+
 export function initPriceState(basePrice: number, params: PriceParams): PriceState {
   if (!(basePrice > 0)) {
     throw new Error(`basePrice must be positive, received ${basePrice}`);
@@ -100,7 +135,8 @@ export function initPriceState(basePrice: number, params: PriceParams): PriceSta
   if (!(persistence >= 0)) {
     throw new Error(`trendPersistenceSec must be >= 0, received ${persistence}`);
   }
-  return { price: basePrice, garch: initGarch(params.garch), momentum: 0 };
+  if (!params.msm && !params.garch) throw new Error("PriceParams needs garch or msm");
+  return { price: basePrice, garch: params.msm ? null : initGarch(params.garch!), momentum: 0 };
 }
 
 export function stepPrice(input: StepPriceInput): StepPriceOutput {
@@ -109,6 +145,7 @@ export function stepPrice(input: StepPriceInput): StepPriceOutput {
     params,
     dtSec,
     z,
+    volScale = 1,
     driftBias,
     magnet,
     anchorTarget,
@@ -116,7 +153,17 @@ export function stepPrice(input: StepPriceInput): StepPriceOutput {
     selfAnchorAlpha,
   } = input;
 
-  const { state: garch, sigma } = stepGarch(state.garch, params.garch, z);
+  // Volatility. MSM is exogenous — the caller already folded its layers into
+  // volScale. GARCH is endogenous: this tick's shock feeds the next variance.
+  let garch = state.garch;
+  let sigma: number;
+  if (params.msm) {
+    sigma = params.msm.sigma * volScale;
+  } else {
+    const stepped = stepGarch(state.garch!, params.garch!, z);
+    garch = stepped.state;
+    sigma = stepped.sigma * volScale;
+  }
 
   // Momentum: an AR(1) on the shock so a move tends to continue for about
   // trendPersistenceSec. `momentum` stays unit-variance; `shock` is scaled by

@@ -1,12 +1,15 @@
-// Browser side of the live demo. Streams frames from /events, folds the
-// platform messages with applyChartMessage (the web app's own client fold),
-// paints the result with lightweight-charts, and explains the latest tick in
-// the side panel.
+// Browser side of the game demo. Streams frames for the selected market from
+// /events, folds the platform messages with applyChartMessage (the web app's
+// own client fold), paints the result with lightweight-charts, and explains
+// the latest tick in the side panel. Every market is fictional and every price
+// simulated — the page shows a notice saying so before anything else.
 
 import {
   CandlestickSeries,
   CrosshairMode,
   createChart,
+  createTextWatermark,
+  LineStyle,
   type CandlestickData,
   type IPriceLine,
   type UTCTimestamp,
@@ -21,22 +24,48 @@ import {
 import type { Timeframe } from "../src/engine-loop";
 import type {
   DemoMessage,
+  MarketInfo,
+  Quote,
   SettledTradeView,
   Settings,
   TickDetail,
   TradeView,
 } from "./server";
 
-const SYMBOL = "AUDNZD_OTC";
-const PIP = 0.0001;
+const DEFAULT_MARKET = "BOT-BUKT";
 const SPARK_POINTS = 240;
 const LOG_LINES = 40;
+const NOTICE_KEY = "market-sim-notice-ack";
 
 const $ = <T extends Element = HTMLElement>(sel: string): T => {
   const el = document.querySelector<T>(sel);
   if (!el) throw new Error(`missing ${sel}`);
   return el;
 };
+
+// ---- notice screen ---------------------------------------------------------
+
+const notice = $("#notice");
+function showNotice(): void {
+  notice.hidden = false;
+  $<HTMLButtonElement>("#notice-ok").focus();
+}
+$("#notice-ok").addEventListener("click", () => {
+  notice.hidden = true;
+  try {
+    sessionStorage.setItem(NOTICE_KEY, "1");
+  } catch {
+    // Storage blocked — the notice simply shows again next load.
+  }
+});
+$("#notice-open").addEventListener("click", showNotice);
+let acknowledged = false;
+try {
+  acknowledged = sessionStorage.getItem(NOTICE_KEY) === "1";
+} catch {
+  acknowledged = false;
+}
+if (!acknowledged) showNotice();
 
 // ---- chart -------------------------------------------------------------
 
@@ -54,7 +83,12 @@ const series = chart.addSeries(CandlestickSeries, {
   wickUpColor: "#26a69a",
   wickDownColor: "#ef5350",
   borderVisible: false,
-  priceFormat: { type: "price", precision: 5, minMove: 0.00001 },
+});
+// Burned into the chart so a screenshot can't pass for a real market.
+const watermark = createTextWatermark(chart.panes()[0]!, {
+  horzAlign: "center",
+  vertAlign: "center",
+  lines: [],
 });
 
 const toBar = (c: Candle): CandlestickData<UTCTimestamp> => ({
@@ -86,10 +120,14 @@ function paintBar(c: Candle): void {
 
 // ---- state -------------------------------------------------------------
 
+let marketId = location.hash.slice(1) || DEFAULT_MARKET;
 let timeframe: Timeframe = "1m";
-let state: ChartState = initialChartState(SYMBOL, timeframe);
-let settings: Settings = { speed: 10, persistence: 0, paused: false, winRate: 0.5 };
+let state: ChartState = initialChartState(marketId, timeframe);
+let settings: Settings = { model: "msm", speed: 10, persistence: 4, paused: false, winRate: 0.5 };
 let stampSec = 1;
+let layerSecs: number[] = [];
+let markets: MarketInfo[] = [];
+const quotes = new Map<string, Quote>();
 let loading = false;
 let buffered: DemoMessage[][] = [];
 
@@ -99,15 +137,28 @@ const volHistory: number[] = [];
 const logLines: { text: string; close: boolean }[] = [];
 let openTrades: TradeView[] = [];
 let settledTrades: SettledTradeView[] = [];
-const priceLines = new Map<string, IPriceLine>();
+const priceLines = new Map<string, IPriceLine[]>();
+let showInternals = true;
+
+const market = (id = marketId): MarketInfo | undefined => markets.find((m) => m.id === id);
+const fmt = (price: number, id = marketId): string => price.toFixed(market(id)?.precision ?? 5);
+const nameOf = (id: string): string => market(id)?.name ?? id;
+
+/** A price change in the market's own unit — pips for currencies, points elsewhere. */
+function moveText(diff: number): string {
+  const m = market();
+  if (!m) return signed(diff, 5);
+  const decimals = Math.max(0, m.precision - Math.round(-Math.log10(m.unit.size)));
+  return `${signed(diff / m.unit.size, decimals)} ${m.unit.label}`;
+}
 
 async function loadHistory(): Promise<void> {
   loading = true;
   buffered = [];
-  state = initialChartState(SYMBOL, timeframe);
-  const res = await fetch(`/history?tf=${timeframe}`);
-  const msg = (await res.json()) as DemoMessage;
-  if (msg.type === "candles:history" && msg.timeframe === timeframe) {
+  state = initialChartState(marketId, timeframe);
+  const res = await fetch(`/history?market=${encodeURIComponent(marketId)}&tf=${timeframe}`).catch(() => null);
+  const msg = res?.ok ? ((await res.json()) as DemoMessage) : null;
+  if (msg?.type === "candles:history" && msg.symbol === marketId && msg.timeframe === timeframe) {
     state = applyChartMessage(state, msg);
   }
   paintAll();
@@ -126,6 +177,45 @@ async function loadHistory(): Promise<void> {
 
 // ---- stream ------------------------------------------------------------
 
+let events: EventSource | null = null;
+
+/** Watch a market: one event stream per market, so only its ticks arrive. */
+function selectMarket(id: string): void {
+  marketId = id;
+  if (location.hash.slice(1) !== id) history.replaceState(null, "", `#${id}`);
+  volHistory.length = 0;
+  lastDetail = null;
+  lastEffect = "—";
+  events?.close();
+  events = new EventSource(`/events?market=${encodeURIComponent(id)}`);
+  events.onmessage = (e: MessageEvent<string>) => handleFrame(JSON.parse(e.data) as DemoMessage[]);
+  events.onerror = () => {
+    $("#stats").textContent = "disconnected — is the server running?";
+  };
+  applyMarketLook();
+  resyncPriceLines();
+  void loadHistory();
+}
+
+function applyMarketLook(): void {
+  const m = market();
+  if (!m) return;
+  series.applyOptions({ priceFormat: { type: "price", precision: m.precision, minMove: m.tickSize } });
+  watermark.applyOptions({
+    lines: [
+      { text: "SIMULATED", color: "rgba(124, 92, 255, 0.16)", fontSize: 56, fontStyle: "bold" },
+      { text: `${m.name} · fictional market`, color: "rgba(138, 147, 164, 0.18)", fontSize: 16 },
+    ],
+  });
+  const icon = $("#m-icon");
+  icon.textContent = m.badge;
+  icon.style.background = m.color;
+  $("#m-name").textContent = m.name;
+  $("#m-sub").textContent = m.subtitle;
+  document.title = `${m.name} · Market Sim Game`;
+  renderMarketList();
+}
+
 function handleFrame(frame: DemoMessage[]): void {
   if (loading) {
     buffered.push(frame);
@@ -136,28 +226,44 @@ function handleFrame(frame: DemoMessage[]): void {
       case "settings":
         settings = msg.settings;
         stampSec = msg.stampSec;
+        layerSecs = msg.layerSecs;
         renderControls();
+        break;
+      case "markets":
+        markets = msg.markets;
+        if (!market()) {
+          // Unknown id in the URL — fall back to the default market.
+          selectMarket(DEFAULT_MARKET);
+          return;
+        }
+        applyMarketLook();
+        break;
+      case "quotes":
+        for (const q of msg.quotes) quotes.set(q.id, q);
+        renderQuotes();
         break;
       case "reset":
         volHistory.length = 0;
         lastDetail = null;
         lastEffect = "—";
-        log("— chart rebuilt —", true);
+        log("— charts rebuilt —", true);
         void loadHistory();
         return;
       case "candle:close": {
+        if (msg.symbol !== marketId) break;
         const next = applyChartMessage(state, msg);
         if (next !== state) {
           state = next;
           paintBar(msg.candle);
           log(
-            `${msg.timeframe} CLOSED ${hhmm(msg.candle.openTs)}  O ${msg.candle.o.toFixed(5)} H ${msg.candle.h.toFixed(5)} L ${msg.candle.l.toFixed(5)} C ${msg.candle.c.toFixed(5)}`,
+            `${msg.timeframe} CLOSED ${hhmm(msg.candle.openTs)}  O ${fmt(msg.candle.o)} H ${fmt(msg.candle.h)} L ${fmt(msg.candle.l)} C ${fmt(msg.candle.c)}`,
             true,
           );
         }
         break;
       }
       case "tick": {
+        if (msg.symbol !== marketId) break;
         const before = state.forming;
         state = applyChartMessage(state, msg);
         const after = state.forming;
@@ -166,13 +272,13 @@ function handleFrame(frame: DemoMessage[]): void {
         break;
       }
       case "detail":
+        if (msg.symbol !== marketId) break;
         lastDetail = msg;
         volHistory.push(msg.volMultiple);
         if (volHistory.length > SPARK_POINTS) volHistory.shift();
         if (settings.speed <= 10 || settings.paused) {
-          const d = msg.price - msg.prevPrice;
           log(
-            `${hhmmss(msg.ts)}  z ${signed(msg.z, 2)}  vol ×${msg.volMultiple.toFixed(2)}  → ${msg.price.toFixed(5)} (${signed(d / PIP, 1)} pips)`,
+            `${hhmmss(msg.ts)}  z ${signed(msg.z, 2)}  vol ×${msg.volMultiple.toFixed(2)}  → ${fmt(msg.price)} (${moveText(msg.price - msg.prevPrice)})`,
             false,
           );
         }
@@ -184,18 +290,19 @@ function handleFrame(frame: DemoMessage[]): void {
         break;
       case "trade:open":
         openTrades = [...openTrades, msg.trade];
-        addPriceLine(msg.trade);
+        addPriceLines(msg.trade);
         log(
-          `TRADE OPEN  ${msg.trade.direction}  entry ${msg.trade.entryPrice.toFixed(5)}  → target ${msg.trade.targetPrice.toFixed(5)}  ${msg.trade.pathStyle}`,
+          `TRADE OPEN  ${nameOf(msg.trade.market)} ${msg.trade.direction}  entry ${fmt(msg.trade.entryPrice, msg.trade.market)}  ${msg.trade.stake} hamoud` +
+            (showInternals ? `  [planned ${msg.trade.planned} · ${msg.trade.pathStyle}]` : ""),
           true,
         );
         break;
       case "trade:settle":
         openTrades = openTrades.filter((t) => t.id !== msg.trade.id);
         settledTrades = [msg.trade, ...settledTrades].slice(0, 20);
-        removePriceLine(msg.trade.id);
+        removePriceLines(msg.trade.id);
         log(
-          `TRADE ${msg.trade.outcome}  ${msg.trade.direction}  exit ${msg.trade.exitPrice.toFixed(5)}  pnl ${signed(msg.trade.pnl / 100, 2)}`,
+          `TRADE ${msg.trade.outcome}  ${nameOf(msg.trade.market)} ${msg.trade.direction}  exit ${fmt(msg.trade.exitPrice, msg.trade.market)}`,
           true,
         );
         break;
@@ -207,42 +314,48 @@ function handleFrame(frame: DemoMessage[]): void {
   scheduleRender();
 }
 
-function addPriceLine(trade: TradeView): void {
-  // Draw the ENTRY price, not the target. The target is where the magnet is
-  // pulling the chart to behind the scenes; the user cares about "is price
-  // above or below where I entered". Same UX as every real binary-options
-  // platform.
-  const line = series.createPriceLine({
-    price: trade.entryPrice,
-    color: trade.direction === "UP" ? "#26a69a" : "#ef5350",
-    lineWidth: 2,
-    lineStyle: 2, // dashed
-    axisLabelVisible: true,
-    title: `${trade.direction} ${trade.id}`,
-  });
-  priceLines.set(trade.id, line);
+function addPriceLines(trade: TradeView): void {
+  if (trade.market !== marketId) return;
+  const lines = [
+    series.createPriceLine({
+      price: trade.entryPrice,
+      color: trade.direction === "UP" ? "#26a69a" : "#ef5350",
+      lineWidth: 2,
+      lineStyle: LineStyle.Dashed,
+      axisLabelVisible: true,
+      title: `${trade.direction} ${trade.id}`,
+    }),
+  ];
+  // Where the game is steering the chart. Hidden when internals are off.
+  if (showInternals) {
+    lines.push(
+      series.createPriceLine({
+        price: trade.targetPrice,
+        color: "#a58bff",
+        lineWidth: 1,
+        lineStyle: LineStyle.Dotted,
+        axisLabelVisible: true,
+        title: `target ${trade.id} · planned ${trade.planned}`,
+      }),
+    );
+  }
+  priceLines.set(trade.id, lines);
 }
 
-function removePriceLine(id: string): void {
-  const line = priceLines.get(id);
-  if (line) {
-    series.removePriceLine(line);
-    priceLines.delete(id);
-  }
+function removePriceLines(id: string): void {
+  for (const line of priceLines.get(id) ?? []) series.removePriceLine(line);
+  priceLines.delete(id);
 }
 
 function resyncPriceLines(): void {
-  for (const [id, line] of priceLines) {
-    series.removePriceLine(line);
-    priceLines.delete(id);
-  }
-  for (const t of openTrades) addPriceLine(t);
+  for (const id of [...priceLines.keys()]) removePriceLines(id);
+  for (const t of openTrades) addPriceLines(t);
 }
 
 function describeEffect(before: Candle | null, after: Candle | null, price: number): string {
   if (!after) return "Bucket already closed — tick ignored.";
   if (!before || before.openTs !== after.openTs) {
-    return `Crossed into a new ${timeframe} bucket → new candle opens at ${price.toFixed(5)}.`;
+    return `Crossed into a new ${timeframe} bucket → new candle opens at ${fmt(price)}.`;
   }
   if (after.h > before.h) {
     return price === after.c && after.c >= after.o
@@ -256,12 +369,6 @@ function describeEffect(before: Candle | null, after: Candle | null, price: numb
   }
   return "Inside the range → only the close moves; whatever it pulls back from stays as wick.";
 }
-
-const events = new EventSource("/events");
-events.onmessage = (e: MessageEvent<string>) => handleFrame(JSON.parse(e.data) as DemoMessage[]);
-events.onerror = () => {
-  $("#stats").textContent = "disconnected — is the server running?";
-};
 
 // ---- controls ----------------------------------------------------------
 
@@ -287,17 +394,22 @@ for (const btn of document.querySelectorAll<HTMLButtonElement>("#speed button"))
 for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-skip]")) {
   btn.addEventListener("click", () => void control({ action: "skip", minutes: Number(btn.dataset.skip) }));
 }
+for (const btn of document.querySelectorAll<HTMLButtonElement>("#model button")) {
+  btn.addEventListener("click", () => void control({ action: "model", value: btn.dataset.model }));
+}
 $("#pause").addEventListener("click", () => void control({ action: settings.paused ? "resume" : "pause" }));
 $("#step").addEventListener("click", () => void control({ action: "step" }));
 $("#restart").addEventListener("click", () => void control({ action: "restart" }));
-$<HTMLSelectElement>("#wicks").addEventListener("change", (e) =>
-  void control({ action: "persistence", value: Number((e.target as HTMLSelectElement).value) }),
-);
 
-for (const btn of document.querySelectorAll<HTMLButtonElement>(".trade-group .dir")) {
+for (const btn of document.querySelectorAll<HTMLButtonElement>(".dir")) {
   btn.addEventListener("click", () => {
-    const durationSec = Number($<HTMLSelectElement>("#trade-duration").value);
-    void control({ action: "trade", direction: btn.dataset.dir, durationSec });
+    void control({
+      action: "trade",
+      market: marketId,
+      direction: btn.dataset.dir,
+      durationSec: Number($<HTMLSelectElement>("#trade-duration").value),
+      stake: Number($<HTMLSelectElement>("#trade-stake").value),
+    });
   });
 }
 for (const btn of document.querySelectorAll<HTMLButtonElement>("#winrate button")) {
@@ -305,8 +417,14 @@ for (const btn of document.querySelectorAll<HTMLButtonElement>("#winrate button"
     void control({ action: "winRate", value: Number(btn.dataset.winrate) }),
   );
 }
+$<HTMLInputElement>("#internals").addEventListener("change", (e) => {
+  showInternals = (e.target as HTMLInputElement).checked;
+  document.body.classList.toggle("hide-internals", !showInternals);
+  resyncPriceLines();
+  scheduleRender();
+});
 
-// Sidebar trendPersistenceSec control. Every change rebuilds the chart from the
+// Sidebar trendPersistenceSec control. Every change rebuilds the charts from the
 // seed, so dragging only previews the number and the rebuild happens on release.
 const persistRange = $<HTMLInputElement>("#persist-range");
 const persistNum = $<HTMLInputElement>("#persist-num");
@@ -319,41 +437,85 @@ persistRange.addEventListener("input", () => (persistNum.value = persistRange.va
 persistRange.addEventListener("change", () => setPersistence(persistRange.valueAsNumber));
 persistNum.addEventListener("change", () => setPersistence(persistNum.valueAsNumber));
 
+window.addEventListener("hashchange", () => {
+  const id = location.hash.slice(1);
+  if (id && id !== marketId && market(id)) selectMarket(id);
+});
+
 function renderControls(): void {
-  for (const btn of document.querySelectorAll<HTMLButtonElement>("#tf button")) {
-    btn.setAttribute("aria-pressed", String(btn.dataset.tf === timeframe));
-  }
-  for (const btn of document.querySelectorAll<HTMLButtonElement>("#speed button")) {
-    btn.setAttribute("aria-pressed", String(Number(btn.dataset.speed) === settings.speed));
-  }
-  for (const btn of document.querySelectorAll<HTMLButtonElement>("#winrate button")) {
-    btn.setAttribute("aria-pressed", String(Number(btn.dataset.winrate) === settings.winRate));
-  }
+  const press = (sel: string, on: (b: HTMLButtonElement) => boolean): void => {
+    for (const b of document.querySelectorAll<HTMLButtonElement>(sel)) b.setAttribute("aria-pressed", String(on(b)));
+  };
+  press("#tf button", (b) => b.dataset.tf === timeframe);
+  press("#speed button", (b) => Number(b.dataset.speed) === settings.speed);
+  press("#winrate button", (b) => Number(b.dataset.winrate) === settings.winRate);
+  press("#model button", (b) => b.dataset.model === settings.model);
   $("#pause").textContent = settings.paused ? "Resume" : "Pause";
   $("#pause").setAttribute("aria-pressed", String(settings.paused));
   $<HTMLButtonElement>("#step").disabled = !settings.paused;
-
-  // A value set from the sidebar may not be one of the A–E presets; show it in
-  // the header as a "Custom" entry rather than a blank select.
-  const wicks = $<HTMLSelectElement>("#wicks");
-  const isPreset = [...wicks.options].some(
-    (o) => o.dataset.custom === undefined && Number(o.value) === settings.persistence,
-  );
-  let custom = wicks.querySelector<HTMLOptionElement>("option[data-custom]");
-  if (isPreset) {
-    custom?.remove();
-  } else {
-    if (!custom) {
-      custom = document.createElement("option");
-      custom.dataset.custom = "";
-      wicks.append(custom);
-    }
-    custom.value = String(settings.persistence);
-    custom.textContent = `Custom — ${settings.persistence}s`;
-  }
-  wicks.value = String(settings.persistence);
   persistNum.value = String(settings.persistence);
   persistRange.value = String(Math.min(settings.persistence, Number(persistRange.max)));
+  $("#msm-detail").hidden = settings.model !== "msm";
+  $("#vol-title").textContent = settings.model === "msm" ? "Volatility (MSM)" : "Volatility (GARCH)";
+  $("#vol-hint").textContent =
+    settings.model === "msm"
+      ? "8 layers multiply together. Each flips between high and low now and then, the slowest every few days, the fastest every second, so calm and busy spells nest inside each other like real markets. Time of day scales it up at the busy hours, and a rare news shock adds a surge that fades over ~10 minutes."
+      : "GARCH: big shocks raise volatility for the next few ticks, then it fades back within seconds. Calm and busy spells barely last, so longer charts look like even noise.";
+}
+
+// ---- market list --------------------------------------------------------
+
+function renderMarketList(): void {
+  const nav = $("#markets");
+  const groups = [...new Set(markets.map((m) => m.group))];
+  nav.replaceChildren(
+    ...groups.flatMap((g) => {
+      const h = document.createElement("h3");
+      h.textContent = g;
+      return [
+        h,
+        ...markets
+          .filter((m) => m.group === g)
+          .map((m) => {
+            const b = document.createElement("button");
+            b.className = "mkt";
+            b.dataset.market = m.id;
+            b.setAttribute("aria-current", String(m.id === marketId));
+            b.setAttribute("aria-label", `${m.name}, ${m.subtitle} — simulated market`);
+            b.innerHTML =
+              `<span class="icon" style="background:${m.color}">${m.badge}</span>` +
+              `<span><span class="nm"></span><br><span class="sb"></span></span>` +
+              `<span class="px"><span class="p">—</span><small class="c"></small></span>`;
+            b.querySelector(".nm")!.textContent = m.name;
+            b.querySelector(".sb")!.textContent = m.subtitle;
+            b.addEventListener("click", () => {
+              if (m.id !== marketId) selectMarket(m.id);
+            });
+            return b;
+          }),
+      ];
+    }),
+  );
+  renderQuotes();
+}
+
+function renderQuotes(): void {
+  for (const b of document.querySelectorAll<HTMLButtonElement>(".mkt")) {
+    const q = quotes.get(b.dataset.market!);
+    if (!q) continue;
+    b.querySelector(".p")!.textContent = fmt(q.price, q.id);
+    const c = b.querySelector<HTMLElement>(".c")!;
+    c.textContent = `${signed(q.changePct, 2)}%`;
+    c.className = `c ${q.changePct >= 0 ? "up" : "down"}`;
+  }
+  const q = quotes.get(marketId);
+  if (q) {
+    // The header follows live ticks when they arrive; quotes fill in otherwise.
+    if (!lastDetail) $("#m-price").textContent = fmt(q.price);
+    const chg = $("#m-chg");
+    chg.textContent = `${signed(q.changePct, 2)}% 24h`;
+    chg.className = `chg ${q.changePct >= 0 ? "up" : "down"}`;
+  }
 }
 
 // ---- side panel ---------------------------------------------------------
@@ -372,19 +534,23 @@ function renderPanel(): void {
   const d = lastDetail;
   const f = state.forming;
 
-  // Follows the setting itself, not the last tick — right after a change there
-  // may be no tick yet (at 1× the next one is a second away).
   $("#mom-hint").textContent =
     settings.persistence > 0
       ? `On (${settings.persistence}s). Part of the last push carries into this tick, so moves run on instead of reversing — fuller bodies, shorter wicks.`
-      : "Off (wicks A). Every tick is independent, so the price zig-zags inside the candle — that back-and-forth is what draws the wicks.";
+      : "Off. Every tick is independent, so the price zig-zags inside the candle — that back-and-forth is what draws the wicks.";
 
   if (d) {
     $("#clock").textContent = `${hhmmss(d.ts)} UTC`;
+    $("#m-price").textContent = fmt(d.price);
     $("#z").textContent = signed(d.z, 2);
     setBar($("#z-bar"), d.z / 3);
     $("#vol").textContent = `×${d.volMultiple.toFixed(2)} of normal`;
     renderSpark();
+    renderLayers(d);
+    $("#tod").textContent = `×${d.intraday.toFixed(2)}`;
+    const newsEl = $("#news");
+    newsEl.textContent = d.news >= 0.05 ? `+${d.news.toFixed(1)}× fading` : "calm";
+    newsEl.className = `v ${d.news >= 0.5 ? "flag" : ""}`;
 
     if (settings.persistence > 0) {
       $("#mom").textContent = signed(d.momentum, 2);
@@ -394,9 +560,17 @@ function renderPanel(): void {
       setBar($("#mom-bar"), 0);
     }
 
+    const steering = openTrades.some((t) => t.market === marketId);
+    $("#steer").textContent = steering
+      ? `${signed(d.steer, 2)}σ${d.snap !== 0 ? ` · snap ${moveText(d.snap)}` : ""}`
+      : "none";
+    $("#steer-hint").textContent = steering
+      ? "Pull toward the open trade's target, in units of one tick's normal move (capped at 1.5σ). In the last 6 s a snap eases the price onto the target."
+      : "Only active while this market has an open trade.";
+
     const diff = d.price - d.prevPrice;
     const move = $("#move");
-    move.textContent = `${d.prevPrice.toFixed(5)} → ${d.price.toFixed(5)}  ${signed(diff / PIP, 1)}p`;
+    move.textContent = `${fmt(d.prevPrice)} → ${fmt(d.price)}  ${moveText(diff)}`;
     move.className = `v ${diff > 0 ? "up" : diff < 0 ? "down" : ""}`;
   }
 
@@ -405,10 +579,10 @@ function renderPanel(): void {
     const n = Math.min(total, Math.floor((lastDetail ? lastDetail.ts - f.openTs : 0) / stampSec) + 1);
     $("#tickpos").textContent = `tick ${n} / ${total}`;
     $("#forming-title").textContent = `Forming ${timeframe} candle · opened ${hhmm(f.openTs)}`;
-    $("#o").textContent = f.o.toFixed(5);
-    $("#h").textContent = f.h.toFixed(5);
-    $("#l").textContent = f.l.toFixed(5);
-    $("#c").textContent = f.c.toFixed(5);
+    $("#o").textContent = fmt(f.o);
+    $("#h").textContent = fmt(f.h);
+    $("#l").textContent = fmt(f.l);
+    $("#c").textContent = fmt(f.c);
     renderCandle(f);
   }
   $("#effect").textContent = lastEffect;
@@ -417,7 +591,7 @@ function renderPanel(): void {
   const body = ranged.length
     ? (100 * ranged.reduce((s, c) => s + Math.abs(c.c - c.o) / (c.h - c.l), 0)) / ranged.length
     : 0;
-  $("#stats").textContent = `${state.candles.length} closed ${timeframe} candles · body averages ${body.toFixed(0)}% of range`;
+  $("#stats").textContent = `SIMULATED · ${state.candles.length} closed ${timeframe} candles · body averages ${body.toFixed(0)}% of range`;
 
   renderPositions();
 
@@ -430,6 +604,30 @@ function renderPanel(): void {
       return li;
     }),
   );
+}
+
+function renderLayers(d: TickDetail): void {
+  const box = $("#layers");
+  if (!d.layers) {
+    box.replaceChildren();
+    return;
+  }
+  if (box.children.length !== d.layers.length) {
+    box.replaceChildren(
+      ...d.layers.map((_, i) => {
+        const el = document.createElement("div");
+        el.className = "layer";
+        el.innerHTML = `<div class="cell"><span></span></div><small>${duration(layerSecs[i] ?? 0)}</small>`;
+        el.title = `Layer ${i + 1}: flips about every ${duration(layerSecs[i] ?? 0)}`;
+        return el;
+      }),
+    );
+  }
+  d.layers.forEach((v, i) => {
+    const fill = box.children[i]!.querySelector<HTMLElement>("span")!;
+    // Values are m0 (high) or 2 − m0 (low); show high as a full cell.
+    fill.style.height = v >= 1 ? "100%" : "30%";
+  });
 }
 
 function renderPositions(): void {
@@ -447,11 +645,12 @@ function renderPositions(): void {
         const progressPct = total > 0 ? (100 * elapsed) / total : 0;
         const arrow = t.direction === "UP" ? "▲" : "▼";
         li.innerHTML =
-          `<div class="pos-head"><span class="pos-dir ${t.direction.toLowerCase()}">${t.direction} ${arrow}</span>` +
-          `<span class="pos-countdown">${left}s left</span></div>` +
-          `<div class="pos-prices">entry ${t.entryPrice.toFixed(5)} · ${t.pathStyle} path</div>` +
-          `<div class="pos-style">stake ₹${(t.stake / 100).toFixed(0)} · payout ${t.payoutPct}%</div>` +
-          `<div class="pos-progress"><div class="fill" style="width:${progressPct.toFixed(1)}%"></div></div>`;
+          `<div class="pos-head"><span class="pos-mkt"></span><span class="pos-dir ${t.direction.toLowerCase()}">${t.direction} ${arrow}</span>` +
+          `<span class="pos-countdown">${t.market === marketId ? `${left}s left` : "running"}</span></div>` +
+          `<div class="pos-prices">entry ${fmt(t.entryPrice, t.market)} · stake ${t.stake} hamoud</div>` +
+          `<div class="pos-style internal">planned ${t.planned} · target ${fmt(t.targetPrice, t.market)} · ${t.pathStyle} path</div>` +
+          `<div class="pos-progress"><div class="fill" style="width:${t.market === marketId ? progressPct.toFixed(1) : 0}%"></div></div>`;
+        li.querySelector(".pos-mkt")!.textContent = nameOf(t.market);
         return li;
       }),
     );
@@ -459,16 +658,17 @@ function renderPositions(): void {
 
   const settledEl = $("#settled-positions");
   if (settledTrades.length === 0) {
-    settledEl.replaceChildren(emptyLi("Settlements will appear here when a position expires."));
+    settledEl.replaceChildren(emptyLi("Results appear here when a trade's time runs out."));
   } else {
     settledEl.replaceChildren(
       ...settledTrades.map((t) => {
         const li = document.createElement("li");
         li.innerHTML =
-          `<div class="pos-head"><span class="pos-dir ${t.direction.toLowerCase()}">${t.direction} ${t.direction === "UP" ? "▲" : "▼"}</span>` +
-          `<span class="outcome ${t.outcome.toLowerCase()}">${t.outcome} ${signed(t.pnl / 100, 2)}</span></div>` +
-          `<div class="pos-prices">entry ${t.entryPrice.toFixed(5)}  →  exit ${t.exitPrice.toFixed(5)}</div>` +
-          `<div class="pos-style">${t.pathStyle} path</div>`;
+          `<div class="pos-head"><span class="pos-mkt"></span><span class="pos-dir ${t.direction.toLowerCase()}">${t.direction} ${t.direction === "UP" ? "▲" : "▼"}</span>` +
+          `<span class="outcome ${t.outcome.toLowerCase()}">${t.outcome}</span></div>` +
+          `<div class="pos-prices">entry ${fmt(t.entryPrice, t.market)}  →  exit ${fmt(t.exitPrice, t.market)} · ${t.stake} hamoud, nothing paid</div>` +
+          `<div class="pos-style internal">planned ${t.planned}${t.planned === t.outcome ? "" : " — steering missed"} · ${t.pathStyle} path</div>`;
+        li.querySelector(".pos-mkt")!.textContent = nameOf(t.market);
         return li;
       }),
     );
@@ -554,6 +754,13 @@ function hhmm(ts: number): string {
 function signed(x: number, digits: number): string {
   return `${x >= 0 ? "+" : ""}${x.toFixed(digits)}`;
 }
+/** 259200 → "3d", 7340 → "2h", 35 → "35s". */
+function duration(sec: number): string {
+  if (sec >= 86400) return `${Math.round(sec / 86400)}d`;
+  if (sec >= 3600) return `${Math.round(sec / 3600)}h`;
+  if (sec >= 60) return `${Math.round(sec / 60)}m`;
+  return `${Math.round(sec)}s`;
+}
 
 renderControls();
-void loadHistory();
+selectMarket(marketId);

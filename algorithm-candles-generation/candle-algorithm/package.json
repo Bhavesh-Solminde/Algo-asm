@@ -9,6 +9,7 @@
     "example:fast": "tsx example-fast.ts",
     "example:magnet": "tsx example-magnet.ts",
     "live": "tsx live/server.ts",
+    "realism": "tsx realism.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

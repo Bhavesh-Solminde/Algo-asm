@@ -18,8 +18,12 @@
 //      a live price, drawing phantom wicks when the bar closed.
 
 import { CandleAggregator, type Candle } from "./candles";
+import { intradayFactor } from "./intraday";
+import { initMsm, msmMultiplier, stepMsm, type MsmState } from "./msm";
+import { stepNews, withNews } from "./news";
 import { createRng, type Rng } from "./rng";
 import {
+  baseSigma,
   initPriceState,
   stepPrice,
   TICK_DT_SEC,
@@ -43,8 +47,20 @@ export interface LiveAsset {
   readonly params: PriceParams;
   state: PriceState;
   honestState: PriceState;
+  /** MSM layers, shared by the shown and honest paths. Null on GARCH assets. */
+  vol: MsmState | null;
+  /** Current news-shock level (0 = calm), shared by both paths. */
+  news: number;
   anchor: number | null;
   readonly aggregators: Map<Timeframe, CandleAggregator>;
+}
+
+/** When a tick happens. Both fields are optional. */
+export interface TickClock {
+  /** Wall-clock time of the tick (epoch seconds) — drives the intraday profile. */
+  readonly nowSec?: number;
+  /** Simulated seconds this tick covers. Defaults to TICK_DT_SEC. */
+  readonly dtSec?: number;
 }
 
 export interface TickBias {
@@ -83,6 +99,9 @@ export class AssetRegistry {
       params: asset.params,
       state: initPriceState(asset.basePrice, asset.params),
       honestState: initPriceState(asset.basePrice, asset.params),
+      // GARCH assets draw nothing here, so their seeds replay exactly as before.
+      vol: asset.params.msm ? initMsm(asset.params.msm, this.rng.next) : null,
+      news: 0,
       anchor: null,
       aggregators: new Map(
         (Object.keys(TIMEFRAME_SEC) as Timeframe[]).map((tf) => [
@@ -105,21 +124,52 @@ export class AssetRegistry {
   }
 
   /**
+   * Volatility per √second right now, before this tick's MSM switches — what
+   * the next tick will roughly use. The magnet sizes its cap from this.
+   */
+  sigmaNow(symbol: string, nowSec?: number): number {
+    const asset = this.assets.get(symbol);
+    if (!asset) throw new Error(`unknown symbol "${symbol}"`);
+    return baseSigma(asset.state, asset.params) * this.volScale(asset, nowSec);
+  }
+
+  private volScale(asset: LiveAsset, nowSec: number | undefined): number {
+    const { intraday, news } = asset.params;
+    let scale = asset.vol ? msmMultiplier(asset.vol) : 1;
+    if (intraday && nowSec !== undefined) scale *= intradayFactor(intraday, nowSec);
+    return news ? withNews(scale, asset.news, news) : scale;
+  }
+
+  /**
    * Advance one asset by a single tick. Updates both the shown and honest paths.
    * `z` is the standard-normal draw this tick consumed — returned so a viewer
    * can show what moved the price.
    */
-  tick(symbol: string, bias: TickBias): { price: number; sigma: number; z: number } {
+  tick(
+    symbol: string,
+    bias: TickBias,
+    clock: TickClock = {},
+  ): { price: number; sigma: number; z: number } {
     const asset = this.assets.get(symbol);
     if (!asset) throw new Error(`unknown symbol "${symbol}"`);
+    const dtSec = clock.dtSec ?? TICK_DT_SEC;
 
+    const { msm, news, intraday } = asset.params;
+    if (asset.vol && msm) asset.vol = stepMsm(asset.vol, msm, dtSec, this.rng.next);
+    if (news) {
+      // Shocks land more often in the busy hours.
+      const rate = intraday && clock.nowSec !== undefined ? intradayFactor(intraday, clock.nowSec) : 1;
+      asset.news = stepNews(asset.news, news, dtSec, rate, this.rng.next, this.rng.normal);
+    }
+    const volScale = this.volScale(asset, clock.nowSec);
     const z = this.rng.normal();
 
     const out = stepPrice({
       state: asset.state,
       params: asset.params,
-      dtSec: TICK_DT_SEC,
+      dtSec,
       z,
+      volScale,
       driftBias: bias.driftBias,
       magnet: bias.magnet,
       anchorTarget: asset.anchor,
@@ -130,8 +180,9 @@ export class AssetRegistry {
     const honestOut = stepPrice({
       state: asset.honestState,
       params: asset.params,
-      dtSec: TICK_DT_SEC,
+      dtSec,
       z,
+      volScale,
       driftBias: 0,
       magnet: 0,
       anchorTarget: asset.anchor,
@@ -198,7 +249,7 @@ export function startTickLoop(
 
     for (const asset of registry.all()) {
       const bias = biasFor(asset.symbol, nowSec);
-      const out = registry.tick(asset.symbol, bias);
+      const out = registry.tick(asset.symbol, bias, { nowSec });
       // Build the candle from the SHOWN price — the one the client will see
       // on this exact tick — so no closed bar carries a point the live chart
       // did not draw.

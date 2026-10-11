@@ -13,8 +13,8 @@
 //
 //   3. The two call-site functions the engine runs every tick:
 //        - `blendedMagnet(trades, currentPrice, nowSec, sigma)` — the current
-//          per-trade liability-weighted log-gap pull. Multiple live trades
-//          vote with their liability for a direction and the result caps at
+//          per-trade stake-weighted log-gap pull. Multiple live trades
+//          vote with their stake for a direction and the result caps at
 //          MAGNET_CAP·sigma. This is what returns a non-zero Layer 3 magnet
 //          to stepPrice.
 //        - `commitSnap(shownPrice, trades, nowSec, maxTickMove)` — the
@@ -79,20 +79,20 @@ export interface StampedTrade {
   readonly targetPrice: number;
   readonly entrySec: number;
   readonly expirySec: number;
-  /** Trade stake in paise/cents. */
+  /**
+   * Stake in hamoud — the game's coins, with no cash value. Nothing is paid
+   * out; a trade only ends as WIN or LOSS. Used here purely as a vote weight.
+   */
   readonly stake: number;
-  /** Payout multiplier, as a percentage integer (e.g. 85 for 85%). */
-  readonly payoutPct: number;
 }
 
 /**
  * Layer-3 magnet for the current tick. Multiple live trades vote with their
- * liability (`stake * payoutPct / 100`) for a log-space direction; the result
- * is capped at MAGNET_CAP × sigmaTick so the pull always hides inside normal
- * volatility headroom.
+ * stake for a log-space direction; the result is capped at
+ * MAGNET_CAP × sigmaTick so the pull stays inside normal volatility headroom.
  *
- *   numer = Σ liability · pathBias(style, elapsedFrac) · log(target/price) · tighten
- *   denom = Σ liability
+ *   numer = Σ stake · pathBias(style, elapsedFrac) · log(target/price) · tighten
+ *   denom = Σ stake
  *   magnet = clamp( numer / denom , ±MAGNET_CAP·sigmaTick )
  *
  * Grandfathered rows (no verdict / HONEST verdict / no path style / no
@@ -116,7 +116,7 @@ export function blendedMagnet(input: {
     if (pb === 0) continue;
     const gap = Math.log(p.targetPrice / input.currentPrice);
     if (!Number.isFinite(gap) || gap === 0) continue;
-    const liability = (p.stake * p.payoutPct) / 100;
+    const weight = p.stake;
     // Extra tightening inside the final MAGNET_WINDOW_SEC — ramps from 1 at
     // the start of the window up to 2 at expiry. Stops the pull from being
     // washed out by a sequence of adverse z draws in the last few ticks.
@@ -125,8 +125,8 @@ export function blendedMagnet(input: {
       secondsLeft > 0 && secondsLeft <= MAGNET_WINDOW_SEC
         ? 1 + (MAGNET_WINDOW_SEC - secondsLeft) / MAGNET_WINDOW_SEC
         : 1;
-    numer += liability * pb * gap * tighten;
-    denom += liability;
+    numer += weight * pb * gap * tighten;
+    denom += weight;
   }
   if (denom === 0) return 0;
   const combined = numer / denom;

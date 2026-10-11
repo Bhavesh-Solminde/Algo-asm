@@ -34,8 +34,7 @@ const MAX_TICK_MOVE = TICK_SIZE * 200;
 const DURATION_SEC = 60;
 const TARGET_OFFSET_TICKS = 5;
 const STYLE: PathStyle = (process.env.STYLE as PathStyle) ?? "FEINT";
-const STAKE = 100_00; // ₹100 in paise
-const PAYOUT_PCT = 85;
+const STAKE = 100; // hamoud — in-game coins, no cash value
 
 const registry = new AssetRegistry(SEED);
 registry.add({
@@ -65,7 +64,6 @@ const trade: StampedTrade = {
   entrySec,
   expirySec,
   stake: STAKE,
-  payoutPct: PAYOUT_PCT,
 };
 
 console.log(
@@ -85,7 +83,7 @@ const STAMP_SEC = 1;
 for (let dt = STAMP_SEC; dt <= DURATION_SEC; dt += STAMP_SEC) {
   const simSec = entrySec + dt;
   const asset = registry.all()[0]!;
-  const sigmaTick = Math.sqrt(asset.state.garch.sigma2) * Math.sqrt(TICK_DT_SEC);
+  const sigmaTick = registry.sigmaNow(SYMBOL) * Math.sqrt(TICK_DT_SEC);
 
   const magnet = blendedMagnet({
     trades: [trade],
