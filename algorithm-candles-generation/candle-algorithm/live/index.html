@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Candle Generator Live</title>
+  <title>Market Sim Game</title>
   <style>
     :root {
       --bg: #0b0e14;
@@ -16,6 +16,7 @@
       --up: #26a69a;
       --down: #ef5350;
       --accent: #f0b429;
+      --sim: #7c5cff;
       --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     }
     * { box-sizing: border-box; }
@@ -29,6 +30,15 @@
       display: flex;
       flex-direction: column;
     }
+
+    /* Always-on reminder that nothing here is a real market. */
+    .sim-banner {
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 4px 12px;
+      padding: 6px 16px; background: #1d1640; border-bottom: 1px solid #3a2d7a; color: #d7ceff; font-size: 12px; text-align: center;
+    }
+    .sim-banner strong { color: #fff; letter-spacing: .08em; }
+    .sim-banner button { background: transparent; border-color: #5b4bb0; color: #d7ceff; padding: 2px 8px; font-size: 11px; }
+
     header {
       display: flex;
       flex-wrap: wrap;
@@ -38,9 +48,15 @@
       border-bottom: 1px solid var(--line);
       background: var(--panel);
     }
-    .brand { display: flex; align-items: baseline; gap: 10px; margin-right: auto; }
-    .brand h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .01em; }
-    .brand .sym { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+    .brand { display: flex; align-items: center; gap: 10px; margin-right: auto; min-width: 0; }
+    .brand h1 { font-size: 16px; font-weight: 700; margin: 0; letter-spacing: .01em; }
+    .brand .sub { color: var(--muted); font-size: 11px; display: block; }
+    .brand .price { font-family: var(--mono); font-size: 15px; font-weight: 600; margin-left: 8px; }
+    .brand .chg { font-family: var(--mono); font-size: 12px; }
+    .sim-tag {
+      font-size: 10px; font-weight: 700; letter-spacing: .08em; color: #d7ceff; background: #2a2060;
+      border: 1px solid #4a3a9a; border-radius: 4px; padding: 1px 5px;
+    }
     .clock { font-family: var(--mono); color: var(--accent); font-size: 12px; }
     .group { display: flex; align-items: center; gap: 6px; }
     .group > label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
@@ -63,7 +79,31 @@
     button[aria-pressed="true"]:hover:not(:disabled) { background: var(--accent); color: #1a1405; font-weight: 600; }
     button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-    main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 360px; min-height: 0; }
+    main { flex: 1; display: grid; grid-template-columns: 250px minmax(0, 1fr) 360px; min-height: 0; }
+
+    /* Market list */
+    #markets { overflow-y: auto; background: var(--panel); border-right: 1px solid var(--line); }
+    #markets h3 {
+      margin: 0; padding: 10px 14px 4px; font-size: 10px; font-weight: 600; color: var(--faint);
+      text-transform: uppercase; letter-spacing: .1em;
+    }
+    .mkt {
+      display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 10px;
+      width: 100%; padding: 7px 12px; border: 0; border-left: 2px solid transparent; border-radius: 0;
+      background: transparent; text-align: left;
+    }
+    .mkt:hover:not(:disabled) { background: var(--raised); }
+    .mkt[aria-current="true"] { background: var(--raised); border-left-color: var(--accent); }
+    .icon {
+      width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center;
+      font-family: var(--mono); font-size: 10px; font-weight: 700; color: #fff; letter-spacing: .02em;
+      box-shadow: inset 0 0 0 2px rgba(255, 255, 255, .12);
+    }
+    .mkt .nm { font-weight: 700; font-size: 13px; line-height: 1.2; }
+    .mkt .sb { color: var(--muted); font-size: 11px; }
+    .mkt .px { text-align: right; font-family: var(--mono); font-size: 12px; line-height: 1.25; }
+    .mkt .px small { display: block; font-size: 11px; }
+
     #chart-wrap { position: relative; min-height: 420px; border-right: 1px solid var(--line); }
     #chart { position: absolute; inset: 0; }
     #stats {
@@ -74,10 +114,11 @@
     aside { overflow-y: auto; background: var(--panel); }
     section { padding: 14px 16px; border-bottom: 1px solid var(--line); }
     section h2 {
+      display: flex; align-items: center; gap: 8px;
       margin: 0 0 10px; font-size: 11px; font-weight: 600; color: var(--muted);
       text-transform: uppercase; letter-spacing: .08em;
     }
-    ol.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+    ol.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
     ol.steps li { display: grid; grid-template-columns: 20px 1fr; gap: 8px; }
     .n {
       width: 20px; height: 20px; border-radius: 50%; background: var(--raised); border: 1px solid var(--line);
@@ -94,6 +135,14 @@
     .up { color: var(--up); }
     .down { color: var(--down); }
     .flag { color: var(--accent); font-weight: 600; }
+
+    /* MSM layers: one cell per layer, tall = the layer is in its high state */
+    .layers { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; margin-top: 8px; }
+    .layer { display: grid; gap: 3px; text-align: center; }
+    .layer .cell { height: 22px; background: var(--raised); border-radius: 3px; position: relative; overflow: hidden; }
+    .layer .cell span { position: absolute; left: 0; right: 0; bottom: 0; background: var(--accent); opacity: .85; transition: height .15s; }
+    .layer small { font-family: var(--mono); font-size: 9px; color: var(--faint); }
+    .model-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
 
     .anatomy { display: grid; grid-template-columns: 150px 1fr; gap: 12px; align-items: center; }
     .ohlc { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-family: var(--mono); font-size: 12px; }
@@ -120,24 +169,30 @@
     #log li { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     #log li.close { color: var(--text); background: var(--raised); border-left: 2px solid var(--accent); padding: 2px 6px; margin: 2px 0; }
 
-    /* UP/DOWN buttons + Positions panel */
-    .trade-group { gap: 4px; }
-    .trade-group .dir { font-weight: 700; padding: 6px 14px; min-width: 60px; }
-    .trade-group .dir.up    { background: #0f2e2a; color: var(--up);   border-color: #1a5048; }
-    .trade-group .dir.up:hover:not(:disabled)    { background: #1a4a44; }
-    .trade-group .dir.down  { background: #2e1515; color: var(--down); border-color: #552626; }
-    .trade-group .dir.down:hover:not(:disabled)  { background: #4a2222; }
-    .trade-group .dir:disabled { opacity: .5; }
+    /* Trade panel */
+    .trade-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .trade-row label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+    .dirs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+    .dir { font-weight: 700; padding: 9px 14px; font-size: 13px; }
+    .dir.up    { background: #0f2e2a; color: var(--up);   border-color: #1a5048; }
+    .dir.up:hover:not(:disabled)    { background: #1a4a44; }
+    .dir.down  { background: #2e1515; color: var(--down); border-color: #552626; }
+    .dir.down:hover:not(:disabled)  { background: #4a2222; }
+    .check { display: flex; align-items: center; gap: 8px; margin-top: 10px; color: var(--text); font-size: 12px; cursor: pointer; }
+    .check input { accent-color: var(--accent); }
+    .internal { color: #c9b8ff; }
+    body.hide-internals .internal { display: none; }
 
     ul.positions { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
     ul.positions li {
       background: var(--raised); border: 1px solid var(--line); border-radius: 6px;
       padding: 8px 10px; font-size: 12px; display: grid; gap: 4px;
     }
-    ul.positions .pos-head { display: flex; justify-content: space-between; align-items: center; }
+    ul.positions .pos-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
     ul.positions .pos-dir { font-family: var(--mono); font-weight: 600; letter-spacing: .04em; }
     ul.positions .pos-dir.up { color: var(--up); }
     ul.positions .pos-dir.down { color: var(--down); }
+    ul.positions .pos-mkt { color: var(--text); font-weight: 600; margin-right: auto; }
     ul.positions .pos-style { color: var(--muted); font-size: 11px; }
     ul.positions .pos-prices { font-family: var(--mono); color: var(--muted); font-size: 11px; }
     ul.positions .pos-progress {
@@ -152,19 +207,59 @@
     ul.positions.settled .outcome.loss { color: var(--down); }
     .positions-empty { color: var(--muted); font-size: 12px; font-style: italic; }
 
-    @media (max-width: 900px) {
-      main { grid-template-columns: 1fr; grid-template-rows: 60vh auto; }
-      #chart-wrap { border-right: 0; border-bottom: 1px solid var(--line); }
-      aside { overflow: visible; }
+    /* Notice screen — shown before the game starts */
+    .notice {
+      position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 16px;
+      background: rgba(5, 6, 12, .86); backdrop-filter: blur(4px);
+    }
+    .notice[hidden] { display: none; }
+    .notice-card {
+      width: min(560px, 100%); max-height: calc(100vh - 32px); overflow-y: auto;
+      background: var(--panel); border: 1px solid #3a2d7a; border-radius: 12px; padding: 24px 26px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, .5);
+    }
+    .notice-kicker { color: #b9a8ff; font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+    .notice-card h2 { margin: 6px 0 14px; font-size: 22px; line-height: 1.25; color: #fff; }
+    .notice-card ul { margin: 0 0 20px; padding-left: 18px; display: grid; gap: 10px; color: var(--text); font-size: 14px; line-height: 1.5; }
+    .notice-card li strong { color: #fff; }
+    .notice-card .primary {
+      width: 100%; padding: 11px 16px; font-size: 14px; font-weight: 700;
+      background: var(--sim); border-color: var(--sim); color: #fff;
+    }
+    .notice-card .primary:hover { background: #6a48ff; }
+
+    @media (max-width: 1100px) {
+      /* Stacked layout: the page grows and scrolls instead of fitting the window. */
+      html, body { height: auto; }
+      body { min-height: 100vh; }
+      main { flex: none; grid-template-columns: 210px minmax(0, 1fr); grid-template-rows: minmax(420px, 70vh) auto; }
+      aside { grid-column: 1 / -1; overflow: visible; }
+      #chart-wrap { border-right: 0; }
+    }
+    @media (max-width: 720px) {
+      main { grid-template-columns: 1fr; grid-template-rows: 220px 60vh auto; }
+      #markets { border-right: 0; border-bottom: 1px solid var(--line); }
+      #chart-wrap { min-height: 320px; border-bottom: 1px solid var(--line); }
+      header { padding: 10px; }
     }
   </style>
 </head>
 <body>
+  <div class="sim-banner" role="note">
+    <span><strong>SIMULATED GAME</strong> · every market is fictional · prices are computer-generated, not a real market · stakes are hamoud coins with no cash value, nothing is paid out</span>
+    <button id="notice-open" type="button">Read the notice</button>
+  </div>
+
   <header>
     <div class="brand">
-      <h1>Candle generator — live</h1>
-      <span class="sym">AUDNZD_OTC</span>
-      <span class="clock" id="clock" title="Simulated chart time (UTC)">--:--:--</span>
+      <span class="icon" id="m-icon"></span>
+      <div>
+        <h1 id="m-name">—</h1>
+        <span class="sub"><span id="m-sub"></span> · <span class="sim-tag">SIMULATED</span></span>
+      </div>
+      <span class="price" id="m-price">—</span>
+      <span class="chg" id="m-chg"></span>
+      <span class="clock" id="clock" title="Game clock (UTC)">--:--:--</span>
     </div>
 
     <div class="group">
@@ -199,42 +294,13 @@
         <button data-skip="60">+1h</button>
         <button data-skip="360">+6h</button>
       </div>
-    </div>
-
-    <div class="group">
-      <label for="wicks">Wicks</label>
-      <select id="wicks">
-        <option value="0">A — original</option>
-        <option value="40">B — light</option>
-        <option value="60">C — medium</option>
-        <option value="90">D — strong</option>
-        <option value="120">E — very strong</option>
-      </select>
-      <button id="restart" title="Rebuild from the seed">Restart</button>
-    </div>
-
-    <div class="group trade-group">
-      <label>Win rate</label>
-      <div class="seg" id="winrate" title="Probability each new trade is placed on the winning side">
-        <button data-winrate="0.25">25%</button>
-        <button data-winrate="0.5" aria-pressed="true">50%</button>
-        <button data-winrate="1">100%</button>
-      </div>
-    </div>
-
-    <div class="group trade-group">
-      <label for="trade-duration">Trade</label>
-      <select id="trade-duration" title="Trade duration">
-        <option value="30">30s</option>
-        <option value="60" selected>60s</option>
-        <option value="120">2m</option>
-      </select>
-      <button class="dir up" data-dir="UP" title="Open an UP trade — WIN if close > entry at expiry">UP ▲</button>
-      <button class="dir down" data-dir="DOWN" title="Open a DOWN trade — WIN if close < entry at expiry">DOWN ▼</button>
+      <button id="restart" title="Rebuild every market from the seed">Restart</button>
     </div>
   </header>
 
   <main>
+    <nav id="markets" aria-label="Markets (all fictional)"></nav>
+
     <div id="chart-wrap">
       <div id="stats"></div>
       <div id="chart"></div>
@@ -242,7 +308,62 @@
 
     <aside>
       <section>
+        <h2>Trade <span class="sim-tag">GAME</span></h2>
+        <div class="trade-row">
+          <label for="trade-duration">Time</label>
+          <select id="trade-duration" title="Trade duration">
+            <option value="30">30s</option>
+            <option value="60" selected>60s</option>
+            <option value="120">2m</option>
+          </select>
+          <label for="trade-stake">Stake</label>
+          <select id="trade-stake" title="Stake in hamoud">
+            <option value="10">10 hamoud</option>
+            <option value="50">50 hamoud</option>
+            <option value="100" selected>100 hamoud</option>
+            <option value="500">500 hamoud</option>
+          </select>
+        </div>
+        <div class="dirs">
+          <button class="dir up" data-dir="UP" title="WIN if the price is above entry when time runs out">UP ▲</button>
+          <button class="dir down" data-dir="DOWN" title="WIN if the price is below entry when time runs out">DOWN ▼</button>
+        </div>
+        <div class="hint" style="margin-top:8px">UP wins if the price ends above your entry, DOWN if it ends below. Hamoud are game coins with no cash value. Nothing is paid out: the trade just ends as WIN or LOSS.</div>
+      </section>
+
+      <section>
+        <h2>Game settings</h2>
+        <div class="row">
+          <span class="k">Win rate</span>
+          <div class="seg" id="winrate">
+            <button data-winrate="0.25">25%</button>
+            <button data-winrate="0.5" aria-pressed="true">50%</button>
+            <button data-winrate="1">100%</button>
+          </div>
+        </div>
+        <div class="hint">The game picks each new trade's result with this chance of WIN, then steers the chart toward it.</div>
+        <label class="check"><input type="checkbox" id="internals" checked /> Show game internals (planned result, target line, steering)</label>
+      </section>
+
+      <section>
+        <h2>Open positions</h2>
+        <ul class="positions" id="open-positions"></ul>
+      </section>
+
+      <section>
+        <h2>Recent results</h2>
+        <ul class="positions settled" id="settled-positions"></ul>
+      </section>
+
+      <section>
         <h2>How the last tick was made</h2>
+        <div class="model-row">
+          <span class="k">Price model</span>
+          <div class="seg" id="model">
+            <button data-model="msm" title="Markov-switching multifractal volatility with time-of-day activity">Realistic (MSM)</button>
+            <button data-model="garch" title="The original GARCH(1,1) at the same average volatility">Classic (GARCH)</button>
+          </div>
+        </div>
         <ol class="steps">
           <li>
             <span class="n">1</span>
@@ -255,9 +376,14 @@
           <li>
             <span class="n">2</span>
             <div>
-              <div class="row"><span class="k">Volatility (GARCH)</span><span class="v" id="vol">—</span></div>
+              <div class="row"><span class="k" id="vol-title">Volatility</span><span class="v" id="vol">—</span></div>
               <svg id="vol-spark" width="100%" height="36" viewBox="0 0 300 36" preserveAspectRatio="none" aria-label="Volatility over the last ticks"></svg>
-              <div class="hint">How big moves are right now, vs normal. Big shocks raise it, so busy and quiet stretches cluster.</div>
+              <div id="msm-detail">
+                <div class="layers" id="layers" aria-label="Volatility layers, slowest first"></div>
+                <div class="row" style="margin-top:6px"><span class="hint" style="margin:0">Time of day</span><span class="v" id="tod">—</span></div>
+                <div class="row"><span class="hint" style="margin:0">News shock</span><span class="v" id="news">—</span></div>
+              </div>
+              <div class="hint" id="vol-hint"></div>
             </div>
           </li>
           <li>
@@ -268,21 +394,28 @@
               <div class="hint" id="mom-hint"></div>
               <div class="tune">
                 <label for="persist-num">trendPersistenceSec</label>
-                <input type="range" id="persist-range" min="0" max="300" step="5" value="0" aria-label="trendPersistenceSec slider" />
-                <span class="num"><input type="number" id="persist-num" min="0" max="600" step="1" value="0" />s</span>
+                <input type="range" id="persist-range" min="0" max="120" step="1" value="4" aria-label="trendPersistenceSec slider" />
+                <span class="num"><input type="number" id="persist-num" min="0" max="600" step="1" value="4" />s</span>
               </div>
-              <div class="hint">0 = your original candles. Higher = fuller bodies, shorter wicks. Rebuilds the chart from the same seed.</div>
+              <div class="hint">Higher = fuller bodies, shorter wicks. Rebuilds every chart from the same seed.</div>
             </div>
           </li>
-          <li>
+          <li class="internal">
             <span class="n">4</span>
             <div>
-              <div class="row"><span class="k">New price</span><span class="v" id="move">—</span></div>
-              <div class="hint">price × e<sup>volatility × shock</sup>, rounded to 5 decimals.</div>
+              <div class="row"><span class="k">Game steering</span><span class="v" id="steer">—</span></div>
+              <div class="hint" id="steer-hint">Only active while this market has an open trade.</div>
             </div>
           </li>
           <li>
             <span class="n">5</span>
+            <div>
+              <div class="row"><span class="k">New price</span><span class="v" id="move">—</span></div>
+              <div class="hint">price × e<sup>volatility × shock</sup>, rounded to the market's precision.</div>
+            </div>
+          </li>
+          <li>
+            <span class="n">6</span>
             <div>
               <div class="row"><span class="k">Into the candle</span><span class="v" id="tickpos">—</span></div>
               <div class="hint" id="effect">—</div>
@@ -310,21 +443,26 @@
       </section>
 
       <section>
-        <h2>Open positions</h2>
-        <ul class="positions" id="open-positions"></ul>
-      </section>
-
-      <section>
-        <h2>Recent settlements</h2>
-        <ul class="positions settled" id="settled-positions"></ul>
-      </section>
-
-      <section>
         <h2>Event log</h2>
         <ul id="log"></ul>
       </section>
     </aside>
   </main>
+
+  <div class="notice" id="notice" role="dialog" aria-modal="true" aria-labelledby="notice-title" hidden>
+    <div class="notice-card">
+      <div class="notice-kicker">Before you play</div>
+      <h2 id="notice-title">This is a game, not a real market</h2>
+      <ul>
+        <li><strong>Every market is fictional.</strong> Names like RANK SHIFTY, NOGE/BUKT and ROO/BUK are made up. They don't track any real index, currency, metal or coin.</li>
+        <li><strong>Prices are made by a computer model</strong> as you watch. They are not quotes and tell you nothing about any real market.</li>
+        <li><strong>Stakes are hamoud</strong>, the game's own coins. Hamoud have no cash value and can't be bought, sold or withdrawn. Nothing is paid out: a trade just ends as WIN or LOSS.</li>
+        <li><strong>The game can decide results.</strong> The Win rate setting picks each trade's result in advance and steers the chart toward it, so results say nothing about skill or real markets.</li>
+        <li>Everything in the game can be changed or reset at any time.</li>
+      </ul>
+      <button id="notice-ok" class="primary" type="button">I understand, start the game</button>
+    </div>
+  </div>
 
   <script type="module" src="/client.js"></script>
 </body>
